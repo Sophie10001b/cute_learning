@@ -12,6 +12,13 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 
+from utils import (
+    ROOT_PATH,
+    THIRD_PARTY_HEADER_DIRS,
+    DEFAULT_CFLAGS,
+    DEFAULT_CUDA_CFLAGS,
+)
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -21,9 +28,11 @@ def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
     return load_jit(
         "rmsnorm",
         *args,
-        cuda_files=["/root/autodl-tmp/cute_learning/include/swiglu.cuh"],
+        cuda_files=[str(ROOT_PATH / "include" / "example.cuh")],
         cuda_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
-        extra_include_paths=["/root/autodl-tmp/cute_learning/3rdparty/cutlass/include"]
+        extra_cflags=DEFAULT_CFLAGS,
+        extra_cuda_cflags=DEFAULT_CUDA_CFLAGS,
+        extra_include_paths=THIRD_PARTY_HEADER_DIRS,
     )
 
 
@@ -36,10 +45,16 @@ def rmsnorm(
     module = _jit_rmsnorm_module(input.shape[-1], input.dtype)
     module.rmsnorm(input, weight, output, eps)
 
-if __name__ == '__main__':
+def test():
     a = torch.randn(512, 1024, dtype=torch.float16, device='cuda')
     b = torch.randn(1024, dtype=torch.float16, device='cuda')
     c = torch.empty_like(a)
+    eps = 1e-6
 
-    rmsnorm(a, b, c)
-    pass
+    ref = torch.nn.functional.rms_norm(a, [a.shape[-1]], b, eps)
+    rmsnorm(a, b, c, eps)
+
+    assert torch.allclose(c, ref, atol=1e-3, rtol=1e-3)
+
+if __name__ == "__main__":
+    test()
