@@ -28,7 +28,7 @@ def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
     return load_jit(
         "rmsnorm",
         *args,
-        cuda_files=[str(ROOT_PATH / "include" / "rmsnorm.cuh")],
+        cuda_files=[str(ROOT_PATH / "include" / "example.cuh")],
         cuda_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
         extra_cflags=DEFAULT_CFLAGS,
         extra_cuda_cflags=DEFAULT_CUDA_CFLAGS,
