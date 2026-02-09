@@ -7,5 +7,6 @@ triton_benchmark
 profile_result
 *.ncu-rep
 *.log
+*.nvcudmp
 build
 profiler_logs
