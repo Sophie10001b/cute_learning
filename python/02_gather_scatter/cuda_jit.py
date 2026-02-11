@@ -28,7 +28,7 @@ def _jit_gather_scatter_module(hidden_size: int, dtype: torch.dtype) -> Module:
     return load_jit(
         "gather_scatter",
         *args,
-        cuda_files=[str(ROOT_PATH / "include" / "gather_scatter.cuh")],
+        cuda_files=[str(ROOT_PATH / "include" / "gather_scatter_v2.cuh")],
         cuda_wrappers=[("gather_scatter", f"GatherScatterKernel<{args}>::run")],
         extra_cflags=DEFAULT_CFLAGS,
         extra_cuda_cflags=DEFAULT_CUDA_CFLAGS,
@@ -113,5 +113,5 @@ def trace(t: int, m: int, n: int, k: int, dtype: torch.dtype):
 
 
 if __name__ == "__main__":
-    # test(16384, 8192, 4096, 4096, dtype=torch.float16)
-    trace(16384, 8192, 4096, 4096, dtype=torch.float16)
+    test(16383, 8191, 4095, 4096, dtype=torch.float16)
+    # trace(16384, 8192, 4096, 4096, dtype=torch.float16)
