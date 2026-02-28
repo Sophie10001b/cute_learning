@@ -73,7 +73,11 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     constexpr auto G = kGroupSize;
     constexpr auto NG = kNumGroup;
     constexpr auto GI = kGroupIter;
-    constexpr auto RowG2SPerCTA = kRowG2SPerCTA;
+    constexpr auto RowThreads = kRowG2SPerCTA;
+    constexpr auto ColThreads = kThreadsPerBlock / RowThreads;
+    constexpr auto BMLoop = BM / RowThreads;
+    constexpr auto BNLoop = BN / RowThreads;
+    constexpr auto BKLoop = BK / ColThreads;
     const auto& [A, B, Mask, Index, C, M] = params;
     constexpr uint32_t vec_width = 128 / sizeof(DType);
 
@@ -117,15 +121,47 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     // load mask & index
     //
     const uint32_t Mask_row_offset = bidx * BM;
-    constexpr uint32_t thr_per_col_Mask = kThreadsPerBlock / RowG2SPerCTA;
-    const uint32_t Mask_row = tidx / thr_per_col_Mask;
-    Tensor rMask = make_fragment_like(make_shape(Int<BM / RowG2SPerCTA>{}));
-    Tensor rMask_cta = make_fragment_like(make_shape(Int<BM / RowG2SPerCTA>{}));
+    const uint32_t Mask_row = tidx / ColThreads;
+    uint8_t rMask_arr[BMLoop];
+    uint32_t rIndex_arr[BMLoop];
+    uint8_t rMask_warp_arr[BMLoop];
+    Tensor rMask = make_tensor(make_rmem_ptr(rMask_arr), make_shape(Int<BMLoop>{}));
+    Tensor rIndex = make_tensor(make_rmem_ptr(rIndex_arr), make_shape(Int<BMLoop>{}));
+    Tensor rMask_warp = make_tensor(make_rmem_ptr(rMask_warp_arr), make_shape(Int<BMLoop>{}));
 
     #pragma unroll
-    for (uint32_t i=0, offset=Mask_row_offset + Mask_row; i < cosize(rMask); i++, offset += RowG2SPerCTA) {
+    for (uint32_t i=0, offset=Mask_row_offset + Mask_row; i < size(rMask); i++, offset+=RowThreads) {
         rMask(i) = offset < M ? mMask(make_coord(bidy, offset)) : 0;
-        rMask_cta(i) = __syncthreads_or(rMask(i)) > 0;
+        rIndex(i) = offset < M ? mIndex(make_coord(bidy, offset)) : 0;
+        rMask_warp(i) = static_cast<uint8_t>(__any_sync(0xffffffff, static_cast<int>(rMask(i))) > 0); // skip prologue under warp-level
+    }
+
+    // if (bidx + bidy + bidz == 0) print("[warp=%d, lane=%d], rMask=%d, rMask_warp=%d, rIndex=%d\n", warp_id, lane_id, rMask(0), rMask_warp(0), rIndex(0));
+
+    //
+    // load A & B
+    //
+    auto g2sA_thr = make_ordered_layout(make_shape(_1{}, Int<ColThreads>{}), make_step(_1{}, _0{}));
+    auto g2sA_val = make_ordered_layout(make_shape(_1{}, Int<BKLoop>{}), make_step(_1{}, _0{}));
+    auto g2sA_tv_tiler = product_each(shape(raked_product(g2sA_thr, g2sA_val)));
+    TiledCopy g2sA_copy = make_tiled_copy(
+        Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, DType>{},
+        g2sA_thr, g2sA_val
+    );
+    Tensor gA = zipped_divide(mA, g2sA_tv_tiler);
+
+    auto g2sB_thr = make_ordered_layout(make_shape(Int<RowThreads>{}, Int<ColThreads>{}), make_step(_1{}, _0{}));
+    auto g2sB_val = make_ordered_layout(make_shape(Int<BNLoop>{}, Int<BKLoop>{}), make_step(_1{}, _0{}));
+    auto g2sB_tv_tiler = product_each(shape(raked_product(g2sB_thr, g2sB_val)));
+    TiledCopy g2sB_copy = make_tiled_copy(
+        Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, DType>{},
+        g2sB_thr, g2sB_val
+    );
+    Tensor gB = local_tile(mB, g2sB_tv_tiler, make_coord(bidy * GI + bidz, _));
+
+    if (bidx + bidy + bidz == 0 && tidx == 0) {
+        print(gA); print("\n");
+        print(gB); print("\n");
     }
 }
 

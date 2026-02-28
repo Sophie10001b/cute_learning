@@ -86,4 +86,4 @@ def test(bsz: int, seqlen: int, N: int, K: int, G: int, sparsity: float):
     C = gather_scatter_gemm(A, B, Mask, activation="SiLU", estimate_sparsity=sparsity)
 
 if __name__ == "__main__":
-    test(1, 1024, 4096, 4096, 128, 0.5)
+    test(1, 16, 4096, 4096, 128, 0.25)
