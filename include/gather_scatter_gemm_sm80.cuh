@@ -63,6 +63,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     const uint32_t bdimx = gridDim.x;
     const uint32_t warp_id = tidx / device::kWarpThreads;
     const uint32_t lane_id = tidx % device::kWarpThreads;
+    constexpr uint32_t vec_width = 128 / sizeof(DType);
 
     constexpr auto BM = kBM;
     constexpr auto BN = kBN;
@@ -77,9 +78,8 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     constexpr auto ColThreads = kThreadsPerBlock / RowThreads;
     constexpr auto BMLoop = BM / RowThreads;
     constexpr auto BNLoop = BN / RowThreads;
-    constexpr auto BKLoop = BK / ColThreads;
+    constexpr auto BKLoop = BK / (ColThreads * vec_width);
     const auto& [A, B, Mask, Index, C, M] = params;
-    constexpr uint32_t vec_width = 128 / sizeof(DType);
 
     //
     // prepare tensors and smem layout
@@ -142,7 +142,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     // load A & B
     //
     auto g2sA_thr = make_ordered_layout(make_shape(_1{}, Int<ColThreads>{}), make_step(_1{}, _0{}));
-    auto g2sA_val = make_ordered_layout(make_shape(_1{}, Int<BKLoop>{}), make_step(_1{}, _0{}));
+    auto g2sA_val = make_ordered_layout(make_shape(_1{}, Int<BKLoop * vec_width>{}), make_step(_1{}, _0{}));
     auto g2sA_tv_tiler = product_each(shape(raked_product(g2sA_thr, g2sA_val)));
     TiledCopy g2sA_copy = make_tiled_copy(
         Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, DType>{},
@@ -151,7 +151,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     Tensor gA = zipped_divide(mA, g2sA_tv_tiler);
 
     auto g2sB_thr = make_ordered_layout(make_shape(Int<RowThreads>{}, Int<ColThreads>{}), make_step(_1{}, _0{}));
-    auto g2sB_val = make_ordered_layout(make_shape(Int<BNLoop>{}, Int<BKLoop>{}), make_step(_1{}, _0{}));
+    auto g2sB_val = make_ordered_layout(make_shape(Int<BNLoop>{}, Int<BKLoop * vec_width>{}), make_step(_1{}, _0{}));
     auto g2sB_tv_tiler = product_each(shape(raked_product(g2sB_thr, g2sB_val)));
     TiledCopy g2sB_copy = make_tiled_copy(
         Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, DType>{},
@@ -159,9 +159,44 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     );
     Tensor gB = local_tile(mB, g2sB_tv_tiler, make_coord(bidy * GI + bidz, _));
 
-    if (bidx + bidy + bidz == 0 && tidx == 0) {
-        print(gA); print("\n");
-        print(gB); print("\n");
+    // if (bidx + bidy + bidz == 0 && tidx == 0) {
+    //     print(gA); print("\n");
+    //     print(gB); print("\n");
+    // }
+
+    // prefetch
+    uint32_t k_tile_rest = size<2>(gB);
+    uint32_t k_tile_next = 0;
+
+    ThrCopy g2sA_thr_copy = g2sA_copy.get_slice(tidx % ColThreads);
+    ThrCopy g2sB_thr_copy = g2sB_copy.get_slice(tidx);
+
+    auto gBtB = g2sB_thr_copy.partition_S(gB);
+    auto sAtA = g2sA_thr_copy.partition_D(sA);
+    auto sBtB = g2sB_thr_copy.partition_D(sB);
+
+    // if (bidx + bidy + bidz == 0 && tidx == 0) {
+    //     print(gBtB); print("\n");
+    //     print(sAtA); print("\n");
+    //     print(sBtB); print("\n");
+    // }
+
+    #pragma unroll
+    for (uint32_t i=0; i < Pipeline - 1; ++i) {
+        #pragma unroll
+        for (uint32_t j=0; j < size(rIndex); ++j) {
+            auto gAbA = gA(make_coord(_, _), make_coord(rIndex(j), k_tile_next));
+            auto gAtA = g2sA_thr_copy.partition_S(gAbA);
+            if (bidx + bidy + bidz == 0 && tidx == 0) {
+                print(gAbA); print("\n");
+                print(gAtA); print("\n");
+            }
+        }
+
+        // copy(g2sB_copy, gBtB(_, _, _, k_tile_next), sBtB(_, _, _, i));
+        // cp_async_fence();
+        // --k_tile_rest;
+        // if (k_tile_rest > 0) ++k_tile_next;
     }
 }
 
