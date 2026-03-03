@@ -10,6 +10,9 @@
 
 #include <cute/tensor.hpp>
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
 namespace {
 
 // shared memory
@@ -50,6 +53,7 @@ struct GEMMParams {
 
 constexpr uint32_t kNumWarps = 4;
 constexpr uint32_t kThreadsPerBlock = kNumWarps * device::kWarpThreads;
+namespace cg = cooperative_groups;
 
 template <uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kPipeline, class SLayoutA, class SLayoutB,
           uint32_t kHiddenSize, uint32_t kIntermediateSize, uint32_t kGroupSize, uint32_t kNumGroup, uint32_t kGroupIter,
@@ -63,7 +67,10 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     const uint32_t bdimx = gridDim.x;
     const uint32_t warp_id = tidx / device::kWarpThreads;
     const uint32_t lane_id = tidx % device::kWarpThreads;
-    constexpr uint32_t vec_width = 128 / sizeof(DType);
+    constexpr uint32_t vec_width = 16 / sizeof(DType);
+
+    cg::thread_block this_cta = cg::this_thread_block();
+    auto this_cta_tile = cg::tiled_partition<kThreadsPerBlock>(this_cta);
 
     constexpr auto BM = kBM;
     constexpr auto BN = kBN;
@@ -80,6 +87,11 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     constexpr auto BNLoop = BN / RowThreads;
     constexpr auto BKLoop = BK / (ColThreads * vec_width);
     const auto& [A, B, Mask, Index, C, M] = params;
+
+    if (bidx + bidy + bidz == 0 && tidx == 0) {
+        print("[INFO] BM=%d, BN=%d, BK=%d, Pipeline=%d\n", BM, BN, BK, Pipeline);
+        print("[INFO] RowThreads=%d, ColThreads=%d, BMLoop=%d, BNLoop=%d, BKLoop=%d\n", RowThreads, ColThreads, BMLoop, BNLoop, BKLoop);
+    }
 
     //
     // prepare tensors and smem layout
@@ -114,8 +126,17 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     extern __shared__ uint8_t shared_memory[];
     using SharedMemory = SharedMemory<DType, SLayoutA, SLayoutB>;
     SharedMemory &smem = *reinterpret_cast<SharedMemory*>(shared_memory);
-    Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), make_shape(Int<BM>{}, Int<BK>{}, Int<Pipeline>{}));
-    Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), make_shape(Int<BN>{}, Int<BK>{}, Int<Pipeline>{}));
+
+    Tensor sA = make_tensor(
+        make_smem_ptr(smem.A.begin()),
+        make_shape(Int<BM>{}, Int<BK>{}, Int<Pipeline>{}),
+        make_stride(Int<BK>{}, _1{}, Int<BK * BM>{})
+    );
+    Tensor sB = make_tensor(
+        make_smem_ptr(smem.B.begin()),
+        make_shape(Int<BN>{}, Int<BK>{}, Int<Pipeline>{}),
+        make_stride(Int<BK>{}, _1{}, Int<BK * BN>{})
+    );
 
     //
     // load mask & index
@@ -127,6 +148,8 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     uint8_t rMask_warp_arr[BMLoop];
     Tensor rMask = make_tensor(make_rmem_ptr(rMask_arr), make_shape(Int<BMLoop>{}));
     Tensor rIndex = make_tensor(make_rmem_ptr(rIndex_arr), make_shape(Int<BMLoop>{}));
+
+    // control the skipping in A mat gmem --> smem
     Tensor rMask_warp = make_tensor(make_rmem_ptr(rMask_warp_arr), make_shape(Int<BMLoop>{}));
 
     #pragma unroll
@@ -135,6 +158,13 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
         rIndex(i) = offset < M ? mIndex(make_coord(bidy, offset)) : 0;
         rMask_warp(i) = static_cast<uint8_t>(__any_sync(0xffffffff, static_cast<int>(rMask(i))) > 0); // skip prologue under warp-level
     }
+
+    // control the skipping of this block
+    uint8_t rMask_cta = 0;
+    #pragma unroll
+    for (uint32_t i=0; i < size(rMask); ++i) rMask_cta |= rMask_warp(i);
+    rMask_cta = cg::reduce(this_cta_tile, rMask_cta, cg::bit_or<uint8_t>{});
+    if (rMask_cta == 0) return;
 
     // if (bidx + bidy + bidz == 0) print("[warp=%d, lane=%d], rMask=%d, rMask_warp=%d, rIndex=%d\n", warp_id, lane_id, rMask(0), rMask_warp(0), rIndex(0));
 
@@ -175,28 +205,20 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     auto sAtA = g2sA_thr_copy.partition_D(sA);
     auto sBtB = g2sB_thr_copy.partition_D(sB);
 
-    // if (bidx + bidy + bidz == 0 && tidx == 0) {
-    //     print(gBtB); print("\n");
-    //     print(sAtA); print("\n");
-    //     print(sBtB); print("\n");
-    // }
-
     #pragma unroll
     for (uint32_t i=0; i < Pipeline - 1; ++i) {
         #pragma unroll
         for (uint32_t j=0; j < size(rIndex); ++j) {
             auto gAbA = gA(make_coord(_, _), make_coord(rIndex(j), k_tile_next));
             auto gAtA = g2sA_thr_copy.partition_S(gAbA);
-            if (bidx + bidy + bidz == 0 && tidx == 0) {
-                print(gAbA); print("\n");
-                print(gAtA); print("\n");
-            }
+
+            copy(g2sA_copy, gAtA(make_coord(_, _), _, 0), sAtA(make_coord(_, _), Mask_row, _, i));
         }
 
-        // copy(g2sB_copy, gBtB(_, _, _, k_tile_next), sBtB(_, _, _, i));
-        // cp_async_fence();
-        // --k_tile_rest;
-        // if (k_tile_rest > 0) ++k_tile_next;
+        copy(g2sB_copy, gBtB(make_coord(_, _), _, _, k_tile_next), sBtB(make_coord(_, _), _, _, i));
+        cp_async_fence();
+        --k_tile_rest;
+        if (k_tile_rest > 0) ++k_tile_next;
     }
 }
 
@@ -213,8 +235,8 @@ struct GatherScatterGEMMKernelSM80 {
         using namespace cute;
         using SLayoutAAtom = decltype(GMMA::Layout_K_SW128_Atom<DType>{});
         using SLayoutBAtom = decltype(GMMA::Layout_K_SW128_Atom<DType>{});
-        using SLayoutA = decltype(tile_to_shape(SLayoutAAtom{}, make_shape(Int<kBM>{}, Int<kBK>{}, Int<kPipeline>{})));
-        using SLayoutB = decltype(tile_to_shape(SLayoutBAtom{}, make_shape(Int<kBN>{}, Int<kBK>{}, Int<kPipeline>{})));
+        using SLayoutA = decltype(tile_to_shape(SLayoutAAtom{}, make_shape(Int<kBM>{}, Int<kBK>{}, Int<kPipeline>{}), make_step(_1{}, _0{}, _2{})));
+        using SLayoutB = decltype(tile_to_shape(SLayoutBAtom{}, make_shape(Int<kBN>{}, Int<kBK>{}, Int<kPipeline>{}), make_step(_1{}, _0{}, _2{})));
 
         static constexpr size_t smem_size = size_t(sizeof(SharedMemory<DType, SLayoutA, SLayoutB>));
         printf("Dynamic SMEM Size: %lu\n", smem_size);
