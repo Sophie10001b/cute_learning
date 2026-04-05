@@ -28,6 +28,7 @@ constexpr uint32_t threadsPerCTA = numWarps * device::kWarpThreads;
 constexpr uint32_t G2SRowPerWarp = 4;
 constexpr uint32_t G2SRowPerCTA = G2SRowPerWarp * numWarps;
 constexpr uint32_t G2SColPerCTA = threadsPerCTA / G2SRowPerCTA;
+constexpr uint32_t MMARowPerWarp = 16;
 namespace cg = cooperative_groups;
 
 // layout for smem
@@ -60,21 +61,60 @@ struct SkipHelper {
     uint8_t execute_mma_warp[kMMAIter];
 
     uint8_t rMask[kG2SIter];
+    uint8_t rMask_mma[kMMAIter];
     uint32_t rIndex[kG2SIter];
 };
 
-template <uint32_t kBK, uint32_t kG2SRowPerCTA, typename DType>
+template <uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kG2SRowPerCTA, uint32_t kPipeline, typename DType>
 struct MMAHelper {
-    // gmem -> smem
-    static constexpr uint32_t g2s_col_per_cta = threadsPerCTA / kG2SRowPerCTA;
-    static constexpr uint32_t copy_width = (kBK / g2s_col_per_cta) * 2;
-    using copy_type = CopyWidthToType<copy_width>::type;
-    using g2sA_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<copy_type>>;
-    using s2rA_atom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, DType>;
-    using g2sB_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<copy_type>>;
-    using s2rB_atom = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, DType>;
+    // smem layout
+    using sALayout = decltype(cute::tile_to_shape(
+        cute::GMMA::Layout_K_SW128_Atom<DType>{},
+        cute::make_shape(cute::Int<kBM>{}, cute::Int<kBK>{}, cute::Int<kPipeline>{}),
+        cute::make_step(cute::_1{}, cute::_0{}, cute::_2{})
+    ));
+    using sBLayout = decltype(cute::tile_to_shape(
+        cute::GMMA::Layout_K_SW128_Atom<DType>{},
+        cute::make_shape(cute::Int<kBN>{}, cute::Int<kBK>{}, cute::Int<kPipeline>{}),
+        cute::make_step(cute::_1{}, cute::_0{}, cute::_2{})
+    ));
 
+    // atom
+    static constexpr uint32_t g2s_copy_width = (kBK / G2SColPerCTA) * sizeof(DType);
+    using g2s_copy_type = CopyWidthToType<g2s_copy_width>::type;
+    using g2sA_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<g2s_copy_type>>;
+    using s2rA_atom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, DType>;
+    using g2sB_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<g2s_copy_type>>;
+    using s2rB_atom = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, DType>;
     using mma_atom = cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>;
+
+    // tv layout A
+    using g2sA_thr_layout = decltype(cute::make_ordered_layout(
+        cute::make_shape(cute::_1{}, cute::Int<G2SColPerCTA>{}),
+        cute::make_step(cute::_1{}, cute::_0{})
+    ));
+    using g2sA_val_layout = decltype(cute::make_ordered_layout(
+        cute::make_shape(cute::_1{}, cute::Int<kBK / G2SColPerCTA>{}),
+        cute::make_step(cute::_1{}, cute::_0{})
+    ));
+    using g2sA_tv_tiler = decltype(cute::product_each(cute::shape(cute::raked_product(g2sA_thr_layout{}, g2sA_val_layout{}))));
+    using g2sA_tiled_copy = decltype(cute::make_tiled_copy(
+        g2sA_atom{}, g2sA_thr_layout{}, g2sA_val_layout{}
+    ));
+
+    // tv layout B
+    using g2sB_thr_layout = decltype(cute::make_ordered_layout(
+        cute::make_shape(cute::Int<G2SRowPerCTA>{}, cute::Int<G2SColPerCTA>{}),
+        cute::make_step(cute::_1{}, cute::_0{})
+    ));
+    using g2sB_val_layout = decltype(cute::make_ordered_layout(
+        cute::make_shape(cute::Int<kBN / G2SRowPerCTA>{}, cute::Int<kBK / G2SColPerCTA>{}),
+        cute::make_step(cute::_1{}, cute::_0{})
+    ));
+    using g2sB_tv_tiler = decltype(cute::product_each(cute::shape(cute::raked_product(g2sB_thr_layout{}, g2sB_val_layout{}))));
+    using g2sB_tiled_copy = decltype(cute::make_tiled_copy(
+        g2sB_atom{}, g2sB_thr_layout{}, g2sB_val_layout{}
+    ));
 };
 
 constexpr uint32_t next_pow_of_2(uint32_t x) {
@@ -93,7 +133,7 @@ struct GEMMParams {
 
 // L2 swizzle
 template <uint32_t kL2Group>
-__device__ auto l2_swizzle(
+__device__ __forceinline__ uint2 l2_swizzle(
     const uint32_t bidx, const uint32_t bidy,
     const uint32_t bdimx, const uint32_t bdimy
 ) {
@@ -112,11 +152,20 @@ __device__ auto l2_swizzle(
     }
 }
 
+template <
+typename gATensor, typename gBTensor, typename sATensor, typename sBTensor
+>
+__device__ __forceinline__ void load_AB(
+    const gATensor& gA, const gBTensor& gB, sATensor &sA, sBTensor &sB
+) {
+
+}
+
 // main kernel func
 template <
 uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kL2Group, uint32_t kPipeline,
 uint32_t kN, uint32_t kK, uint32_t kNG, uint32_t kNGIter,
-class SLayoutA, class SLayoutB, typename DType,
+typename kMMAHelper, typename DType,
 uint32_t kG2SRowPerCTA, uint32_t, uint32_t kMMARow
 >
 __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams params) {
@@ -143,12 +192,22 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     const uint32_t bidx = tile_idx.x;
     const uint32_t bidy = tile_idx.y;
     const uint32_t bidz = blockIdx.z;
+    const uint32_t warp_id = tidx / device::kWarpThreads;
+    const uint32_t lane_id = tidx % device::kWarpThreads;
 
     const uint32_t base_off_m = bidx * BM;
     const uint32_t base_off_n = bidy * BN;
     const uint32_t base_off_k = bidz * BK;
+    const uint32_t MMARowPerCTA = MMARowPerWarp * kMMARow;
 
     const uint32_t thread_off_m = base_off_m + tidx / G2SColPerCTA;
+
+    using sALayout = typename kMMAHelper::sALayout;
+    using sBLayout = typename kMMAHelper::sBLayout;
+    using g2sA_tv_tiler = typename kMMAHelper::g2sA_tv_tiler;
+    using g2sB_tv_tiler = typename kMMAHelper::g2sB_tv_tiler;
+    using g2sA_tiled_copy = typename kMMAHelper::g2sA_tiled_copy;
+    using g2sB_tiled_copy = typename kMMAHelper::g2sB_tiled_copy;
 
     //
     // prepare tensors and smem layout
@@ -180,7 +239,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     );
 
     extern __shared__ uint8_t shared_memory[];
-    using SharedMemory = SharedMemory<DType, SLayoutA, SLayoutB>;
+    using SharedMemory = SharedMemory<DType, sALayout, sBLayout>;
     SharedMemory &smem = *reinterpret_cast<SharedMemory*>(shared_memory);
 
     Tensor sA = make_tensor(
@@ -201,28 +260,48 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     // for block skip, the bdimy = 8, NG = 2, NGIter = 4, with coord (bidy // NGIter, ...)
     //
     constexpr uint32_t G2SIter = BM / G2SRowPerCTA;
-    constexpr uint32_t MMAIter = BM / (16 * kMMARow);
+    constexpr uint32_t MMAIter = BM / (MMARowPerWarp * kMMARow);
     SkipHelper<G2SIter, MMAIter> skip_helper;
     CUTE_UNROLL
-    for (uint32_t i=0, off=thread_off_m; i < G2SIter; ++i, off += G2SRowPerCTA) {
+    for (uint32_t i=0, off=thread_off_m; i < G2SIter; ++i, off+=G2SRowPerCTA) {
         skip_helper.rMask[i] = off < M ? mMask(make_coord(bidy / NGIter, off)) : 0;
         skip_helper.rIndex[i] = off < M ? mIndex(make_coord(bidy / NGIter, off)) : 0;
     }
 
-    // check if early exit current block
+    // check if early exit current block or warp's g2s load
     skip_helper.execute_cta = 1;
     cg::thread_block this_cta = cg::this_thread_block();
     auto this_cta_tile = cg::tiled_partition<threadsPerCTA>(this_cta);
     CUTE_UNROLL
-    for (uint32_t i=0; i < G2SIter; ++i) skip_helper.execute_cta &= skip_helper.rMask[i];
+    for (uint32_t i=0; i < G2SIter; ++i) {
+        skip_helper.execute_cta &= skip_helper.rMask[i];
+        skip_helper.execute_g2s_warp[i] = static_cast<uint8_t>(__any_sync(0xffffffff, static_cast<int>(skip_helper.rMask[i] > 0)));
+    }
     skip_helper.execute_cta = cg::reduce(this_cta_tile, skip_helper.execute_cta, cg::bit_and<uint8_t>{});
     if (skip_helper.execute_cta == 0) return;
+
+    // check if mma need execute
+    CUTE_UNROLL
+    for (uint32_t i=0, off=base_off_m + tidx / (threadsPerCTA / MMARowPerCTA); i < MMAIter; ++i, off+=MMARowPerCTA) {
+        skip_helper.rMask_mma[i] = off < M ? mMask(make_coord(bidy / NGIter, off)) : 0;
+        skip_helper.execute_mma_warp[i] = static_cast<uint8_t>(__any_sync(0xffffffff, static_cast<int>(skip_helper.rMask_mma[i] > 0)));
+    }
 
     //
     // prologue, load A & B
     //
     uint8_t producer = 0;
     uint8_t consumer = 0;
+
+    Tensor gA = zipped_divide(mA, g2sA_tv_tiler{});
+    Tensor gB = local_tile(mB, g2sB_tv_tiler{}, make_coord(bidy, _));
+
+    ThrCopy g2sA_thr_copy = g2sA_tiled_copy{}.get_slice(tidx % G2SColPerCTA);
+    ThrCopy g2sB_thr_copy = g2sB_tiled_copy{}.get_slice(tidx);
+
+    auto pDsA = g2sA_thr_copy.partition_D(sA);
+    auto pDsB = g2sB_thr_copy.partition_D(sB);
+    auto pSgB = g2sB_thr_copy.partition_S(gB);
 
 }
 
