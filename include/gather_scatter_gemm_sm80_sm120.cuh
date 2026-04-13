@@ -82,13 +82,13 @@ struct MMAHelper {
     // atom
     static constexpr uint32_t g2s_copy_width = (kBK / G2SColPerCTA) * sizeof(DType);
     using g2s_copy_type = CopyWidthToType<g2s_copy_width>::type;
-    using g2sA_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<g2s_copy_type>>;
+    using g2sA_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL<g2s_copy_type>>;
     using s2rA_atom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, DType>;
-    using g2sB_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<g2s_copy_type>>;
+    using g2sB_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL<g2s_copy_type>>;
     using s2rB_atom = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, DType>;
     using mma_atom = cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>;
 
-    // tv layout A
+    // tv layout g2sA
     using g2sA_thr_layout = decltype(cute::make_ordered_layout(
         cute::make_shape(cute::_1{}, cute::Int<G2SColPerCTA>{}),
         cute::make_step(cute::_1{}, cute::_0{})
@@ -102,7 +102,7 @@ struct MMAHelper {
         g2sA_atom{}, g2sA_thr_layout{}, g2sA_val_layout{}
     ));
 
-    // tv layout B
+    // tv layout g2sB
     using g2sB_thr_layout = decltype(cute::make_ordered_layout(
         cute::make_shape(cute::Int<G2SRowPerCTA>{}, cute::Int<G2SColPerCTA>{}),
         cute::make_step(cute::_1{}, cute::_0{})
@@ -153,12 +153,31 @@ __device__ __forceinline__ uint2 l2_swizzle(
 }
 
 template <
-typename gATensor, typename gBTensor, typename sATensor, typename sBTensor
+typename gATensor, typename gBTensor, typename sATensor, typename sBTensor,
+typename pDsATensor, typename pDsBTensor, typename pSgBTensor,
+typename ThrCopyA, typename TiledCopyA, typename TiledCopyB,
+typename sAtATensor, typename sBtBTensor,
+typename idxTensor, uint32_t kPipeline
 >
-__device__ __forceinline__ void load_AB(
-    const gATensor& gA, const gBTensor& gB, sATensor &sA, sBTensor &sB
+__device__ __forceinline__ uint32_t load_AB(
+    const gATensor& gA,
+    const pDsATensor& pDsA, const pDsBTensor& pDsB, const pSgBTensor& pSgB, const idxTensor& rIndex,
+    const ThrCopyA& g2sA_thr_copy, const TiledCopyA& g2sA_tiled_copy, const TiledCopyB& g2sB_tiled_copy,
+    uint32_t consumer
 ) {
+    using namespace cute;
+    const uint32_t cur_stage = consumer % kPipeline;
 
+    CUTE_UNROLL
+    for (uint32_t i=0, j=threadIdx.x / G2SColPerCTA; i < size(rIndex); ++i, j+=G2SRowPerCTA) {
+        auto gAtA = gA(make_coord(_, _), make_coord(rIndex(i), consumer));
+        auto pSgA = g2sA_thr_copy.partition_S(gAtA);
+        copy(g2sA_tiled_copy, pSgA(make_coord(_, _), _, 0), pDsA(make_coord(_, _), j, _, cur_stage));
+    }
+    copy(g2sB_tiled_copy, pSgB(make_coord(_, _), _, _, cur_stage), pDsB(make_coord(_, _), _, _, cur_stage));
+
+    cute::cp_async_fence();
+    return consumer + 1;
 }
 
 // main kernel func
@@ -208,6 +227,9 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     using g2sB_tv_tiler = typename kMMAHelper::g2sB_tv_tiler;
     using g2sA_tiled_copy = typename kMMAHelper::g2sA_tiled_copy;
     using g2sB_tiled_copy = typename kMMAHelper::g2sB_tiled_copy;
+    using mma_atom = typename kMMAHelper::mma_atom;
+
+    auto tiled_mma = make_tiled_mma(mma_atom{});
 
     //
     // prepare tensors and smem layout
@@ -303,6 +325,119 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     auto pDsB = g2sB_thr_copy.partition_D(sB);
     auto pSgB = g2sB_thr_copy.partition_S(gB);
 
+    // fill the pipeline
+    CUTE_UNROLL
+    for (uint32_t i=0; i < Pipeline - 1; i++) {
+        consumer = load_AB(gA, pDsA, pDsB, pSgB, skip_helper.rIndex, g2sA_thr_copy, g2sA_tiled_copy{}, g2sB_tiled_copy{}, consumer);
+    }
+
+    //
+    // mainloop, issue s2r & mma
+    //
+    ThrMMA thr_mma = tiled_mma.get_slice(tidx);
+
 }
+
+template <
+uint32_t kN, uint32_t kK, uint32_t kNG, uint32_t kNGIter,
+uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kSplitK, uint32_t kPipeline,
+bool kUsePDL, typename DType, uint32_t kAct
+>
+struct GatherScatterGEMMKernel {
+    static void run(
+        const tvm::ffi::TensorView A,
+        const tvm::ffi::TensorView B,
+        const tvm::ffi::TensorView Mask,
+        const tvm::ffi::TensorView Index,
+        const tvm::ffi::TensorView D,
+        const float sparsity
+    ) {
+        using namespace host;
+        RuntimeCheck(
+            sparsity >= 0 && sparsity < 1,
+            "sparsity must be in [0, 1)"
+        );
+
+        auto M = SymbolicSize{"num_tokens"};
+        auto N = SymbolicSize{"out_features"};
+        auto K = SymbolicSize{"in_features"};
+        auto NG = SymbolicSize{"num_groups"};
+        auto NGIter = SymbolicSize{"num_groups_iter"};
+        auto device = SymbolicDevice{};
+
+        N.set_value(kN);
+        K.set_value(kK);
+        NG.set_value(kNG);
+        NGIter.set_value(kNGIter);
+        device.set_options<kDLCUDA>();
+
+        // host-side checking
+        TensorMatcher({M, K}) //
+            .with_strides({K, 1})
+            .with_dtype<DType>()
+            .with_device(device)
+            .verify(A);
+        
+        TensorMatcher({N, K}) //
+            .with_strides({K, 1})
+            .with_dtype<DType>()
+            .with_device(device)
+            .verify(B);
+        
+        TensorMatcher({M, N}) //
+            .with_strides({N, 1})
+            .with_dtype<DType>()
+            .with_device(device)
+            .verify(D);
+        
+        TensorMatcher({NG, M}) //
+            .with_strides({M, 1})
+            .with_dtype<uint8_t>()
+            .with_device(device)
+            .verify(Mask);
+        
+        TensorMatcher({NG, M}) //
+            .with_strides({M, 1})
+            .with_dtype<uint32_t>()
+            .with_device(device)
+            .verify(Index);
+        
+        RuntimeCheck(
+            sizeof(DType) == 2,
+            "DType must be fp16 or bf16"
+        );
+
+        const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+        RuntimeCheck(
+            kK % 32 == 0 && kN % 16 == 0,
+            "N and K must be divisible by 16 and 32"
+        );
+
+        const auto params = GEMMParams{
+            .A = A.data_ptr(),
+            .B = B.data_ptr(),
+            .Mask = Mask.data_ptr(),
+            .Index = Index.data_ptr(),
+            .D = D.data_ptr(),
+            .M = num_tokens
+        };
+
+        // host-side static tiling
+        MMAHelper<kBM, kBN, kBK, G2SRowPerCTA, kPipeline, DType> mma_helper;
+        using sALayout = decltype(mma_helper.sALayout);
+        using sBLayout = decltype(mma_helper.sBLayout);
+
+        static constexpr size_t smem_size = size_t(sizeof(SharedMemory<DType, sALayout, sBLayout>));
+        constexpr auto kernel = gather_scatter_gemm_kernel<
+            kBM, kBN, kBK, 4, kPipeline, kN, kK, kNG, kNGIter,
+            mma_helper, DType, G2SRowPerCTA, kBM / MMARowPerWarp
+        >;
+
+        const dim3 grid_size = {cute::ceil_div(params.M, kBM), cute::ceil_div(kN, kBN), kSplitK};
+        const dim3 block_size = {threadsPerCTA, 1, 1};
+        LaunchKernel(grid_size, block_size, device.unwrap(), smem_size).enable_pdl(kUsePDL)(kernel, params);
+    }
+};
+
 
 } // namespace
