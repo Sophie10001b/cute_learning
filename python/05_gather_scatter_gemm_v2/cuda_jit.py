@@ -112,7 +112,7 @@ def gather_scatter_gemm_cute(
 
         while data_width * Pipeline * (BM * BK + BN * BK) > smem / 2 and BK > 32: # sm80, sm120 need 2+ CTA per SMs
             BK >>= 1
-        while data_width * Pipeline * (BM * BK + BN * BK) > smem / 2 and BN > 32: # sm80, sm120 need 2+ CTA per SMs
+        while data_width * Pipeline * (BM * BK + BN * BK) > smem / 2 and BN > 32:
             BN >>= 1
         
         SplitK = 1

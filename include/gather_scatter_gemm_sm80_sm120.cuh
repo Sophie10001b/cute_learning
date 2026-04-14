@@ -91,6 +91,8 @@ struct MmaTraits {
     static constexpr uint32_t G2SRowPerWarp = WarpLayoutTraits_::G2SRowPerWarp;
     static constexpr uint32_t threadsPerCTA = WarpLayoutTraits_::threadsPerCTA;
     static constexpr uint32_t MMARowPerWarp = WarpLayoutTraits_::MMARowPerWarp;
+    static constexpr uint32_t MMARow = WarpLayoutTraits_::MMARow;
+    static constexpr uint32_t MMACol = WarpLayoutTraits_::MMACol;
 
     template <uint32_t NK>
     static constexpr auto get_smem_swizzle() {
@@ -151,8 +153,25 @@ struct MmaTraits {
         g2sB_atom{}, g2sB_thr_layout{}, g2sB_val_layout{}
     ));
 
+    // tv layout D
+    using D_thr_layout = decltype(cute::make_ordered_layout(
+        cute::make_shape(cute::Int<G2SRowPerCTA>{}, cute::Int<G2SRowPerCTA>{}),
+        cute::make_step(cute::_1{}, cute::_0{})
+    ));
+    using D_val_layout = decltype(cute::make_ordered_layout(
+        cute::make_shape(cute::Int<kBM / G2SRowPerCTA>{}, cute::Int<kBN / G2SRowPerCTA>{}),
+        cute::make_step(cute::_1{}, cute::_0{})
+    ));
+    using D_tv_tiler = decltype(cute::product_each(cute::shape(cute::raked_product(D_thr_layout{}, D_val_layout{}))));
+
     // mma & ldmatrix layout
-    using tiled_mma = decltype(cute::make_tiled_mma(mma_atom{}));
+    using tiled_mma = decltype(cute::make_tiled_mma(
+        mma_atom{},
+        cute::make_ordered_layout(
+            cute::make_shape(cute::Int<MMARow>{}, cute::Int<MMACol>{}),
+            cute::make_step(cute::_1{}, cute::_0{})
+        )
+    ));
     using s2rA_tiled_copy = decltype(cute::make_tiled_copy_A(s2rA_atom{}, tiled_mma{}));
     using s2rB_tiled_copy = decltype(cute::make_tiled_copy_B(s2rB_atom{}, tiled_mma{}));
 };
@@ -224,19 +243,49 @@ __device__ __forceinline__ uint32_t load_AB(
 }
 
 template <
-    typename TiledCopyA, typename TiledCopyB
+    typename pSrATensor, typename pDrATensor, typename pSrBTensor, typename pDrBTensor,
+    typename rATensor, typename rBTensor, typename rDTensor,
+    typename TiledCopyA, typename TiledCopyB, typename TiledGEMM,
+    uint32_t kPipeline
 >
 __device__ __forceinline__ uint32_t issue_mma(
+    const pSrATensor& pSrA, const pDrATensor& pDrA, const pSrBTensor& pSrB, const pDrBTensor& pDrB,
+    const rATensor& rA, const rBTensor& rB, const rDTensor& rD,
     const uint8_t* execute_mma_warp,
-    const TiledCopyA& s2rA_tiled_copy, const TiledCopyB& s2rB_tiled_copy,
+    const TiledCopyA& s2rA_tiled_copy, const TiledCopyB& s2rB_tiled_copy, const TiledGEMM& tiled_gemm,
     uint32_t consumer
-) {}
+) {
+    using namespace cute;
+    const uint32_t cur_stage = consumer % kPipeline;
+
+    CUTE_UNROLL
+    for (uint32_t i=0; i < size<1>(pDrA); ++i) {
+        if (execute_mma_warp[i]) {
+            copy(s2rA_tiled_copy, pSrA(make_coord(_, _), i, _, cur_stage), pDrA(make_coord(_, _), i, _));
+            copy(s2rB_tiled_copy, pSrB(make_coord(_, _), _, _, cur_stage), pDrB(make_coord(_, _), _, _));
+
+            CUTE_UNROLL
+            for (uint32_t j=0; j < size<1>(pDrB); ++j) {
+                CUTE_UNROLL
+                for (uint32_t k=0; k < size<2>(pSrA); ++k) {
+                    gemm(
+                        tiled_gemm,
+                        rA(_, i, k),
+                        rB(_, j, k),
+                        rD(_, i, j)
+                    );
+                }
+            }
+        }
+    }
+    return consumer + 1;
+}
 
 
 
 // main kernel func
 template <
-    uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kL2Group, uint32_t kPipeline,
+    uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kL2Group, uint32_t kPipeline, uint32_t kSplitK,
     uint32_t kN, uint32_t kK, uint32_t kNG, uint32_t kNGIter,
     class WarpLayoutTraits_, class MmaTraits_, typename DType
 >
@@ -251,6 +300,8 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     constexpr uint32_t BN = kBN;
     constexpr uint32_t BK = kBK;
     constexpr uint32_t Pipeline = kPipeline;
+    constexpr uint32_t SplitK = kSplitK;
+    constexpr uint32_t SplitKSize = kK / SplitK;
 
     constexpr uint32_t G2SColPerCTA = WarpLayoutTraits_::G2SColPerCTA;
     constexpr uint32_t G2SRowPerCTA = WarpLayoutTraits_::G2SRowPerCTA;
@@ -263,17 +314,18 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     using sBLayout = typename MmaTraits_::sBLayout;
     using g2sA_tv_tiler = typename MmaTraits_::g2sA_tv_tiler;
     using g2sB_tv_tiler = typename MmaTraits_::g2sB_tv_tiler;
+    using D_tv_tiler = typename MmaTraits_::D_tv_tiler;
     using g2sA_tiled_copy = typename MmaTraits_::g2sA_tiled_copy;
     using g2sB_tiled_copy = typename MmaTraits_::g2sB_tiled_copy;
     using mma_atom = typename MmaTraits_::mma_atom;
     using tiled_mma = typename MmaTraits_::tiled_mma;
-
+    using s2rA_tiled_copy = typename MmaTraits_::s2rA_tiled_copy;
+    using s2rB_tiled_copy = typename MmaTraits_::s2rB_tiled_copy;
 
     // (cdiv(M, BM), cdiv(N, BN), SplitK)
     const uint32_t tidx = threadIdx.x;
     const uint32_t NBM = gridDim.x;
     const uint32_t NBN = gridDim.y;
-    const uint32_t SplitK = gridDim.z;
     const uint2 tile_idx = l2_swizzle<kL2Group>(
         blockIdx.x, blockIdx.y,
         NBM, NBN
@@ -377,6 +429,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
 
     Tensor gA = zipped_divide(mA, g2sA_tv_tiler{});
     Tensor gB = local_tile(mB, g2sB_tv_tiler{}, make_coord(bidy, _));
+    Tensor gD = local_tile(mD, D_tv_tiler{}, make_coord(bidx, bidy));
 
     auto g2sA_thr_copy = g2sA_tiled_copy{}.get_slice(tidx % G2SColPerCTA);
     auto g2sB_thr_copy = g2sB_tiled_copy{}.get_slice(tidx);
@@ -413,10 +466,69 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     ThrMMA thr_mma = tiled_mma{}.get_slice(tidx);
     auto rA = thr_mma.partition_fragment_A(sA(_, _, _0{}));
     auto rB = thr_mma.partition_fragment_B(sB(_, _, _0{}));
+    auto rD = thr_mma.partition_fragment_C(gD);
+    clear(rD);
+
+    auto s2rA_thr_copy = s2rA_tiled_copy{}.get_slice(tidx);
+    auto pSrA = s2rA_thr_copy.partition_S(sA);
+    auto pDrA = s2rA_thr_copy.retile_D(rA);
+
+    auto s2rB_thr_copy = s2rB_tiled_copy{}.get_slice(tidx);
+    auto pSrB = s2rB_thr_copy.partition_S(sB);
+    auto pDrB = s2rB_thr_copy.retile_D(rB);
+
+    const uint32_t k_tile_num = SplitKSize / BK;
+    CUTE_NO_UNROLL
+    for (uint32_t kid=0; kid < k_tile_num - (Pipeline - 1); ++kid) {
+        producer = load_AB<
+            decltype(gA),
+            decltype(pDsA),
+            decltype(pDsB),
+            decltype(pSgB),
+            decltype(g2sA_thr_copy),
+            g2sA_tiled_copy,
+            g2sB_tiled_copy,
+            Pipeline,
+            G2SRowPerCTA,
+            G2SColPerCTA,
+            G2SIter
+        >(
+            gA, pDsA, pDsB, pSgB, skip_helper.rIndex, skip_helper.execute_g2s_warp,
+            g2sA_thr_copy, g2sA_tiled_copy{}, g2sB_tiled_copy{},
+            producer
+        );
+        cp_async_wait<Pipeline - 1>();
+
+        consumer = issue_mma<
+            decltype(pSrA),
+            decltype(pDrA),
+            decltype(pSrB),
+            decltype(pDrB),
+            decltype(rA),
+            decltype(rB),
+            decltype(rD),
+            s2rA_tiled_copy,
+            s2rB_tiled_copy,
+            tiled_mma,
+            Pipeline
+        >(
+            pSrA, pDrA, pSrB, pDrB, rA, rB, rD,
+            skip_helper.execute_mma_warp,
+            s2rB_tiled_copy{}, s2rB_tiled_copy{}, tiled_mma{},
+            consumer
+        );
+    }
+
+    // drain the pipeline
     
     if (tidx == 0 && (bidx + bidy + bidz == 0)) {
-        cute::print(rA);
-        cute::print(rB);
+        cute::print(pSrA); cute::print("\n");
+        cute::print(pDrA); cute::print("\n");
+        cute::print(pSrB); cute::print("\n");
+        cute::print(pDrB); cute::print("\n");
+        cute::print(rA); cute::print("\n");
+        cute::print(rB); cute::print("\n");
+        cute::print(rD); cute::print("\n");
     }
 
 }
@@ -509,7 +621,7 @@ struct GatherScatterGEMMKernel {
         using warp_layout_traits = WarpLayoutTraits<kBM, kBK, 4, sizeof(DType)>;
         using mma_traits = MmaTraits<kBM, kBN, kBK, kPipeline, warp_layout_traits, DType>;
         constexpr auto kernel = gather_scatter_gemm_kernel<
-            kBM, kBN, kBK, 4, kPipeline, kN, kK, kNG, kNGIter,
+            kBM, kBN, kBK, 4, kPipeline, kSplitK, kN, kK, kNG, kNGIter,
             warp_layout_traits, mma_traits, DType
         >;
 
