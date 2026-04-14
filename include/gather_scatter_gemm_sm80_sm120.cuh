@@ -161,7 +161,7 @@ typename idxTensor, uint32_t kPipeline
 >
 __device__ __forceinline__ uint32_t load_AB(
     const gATensor& gA,
-    const pDsATensor& pDsA, const pDsBTensor& pDsB, const pSgBTensor& pSgB, const idxTensor& rIndex,
+    const pDsATensor& pDsA, const pDsBTensor& pDsB, const pSgBTensor& pSgB, const idxTensor& rIndex, const uint8_t* execute_g2s_warp,
     const ThrCopyA& g2sA_thr_copy, const TiledCopyA& g2sA_tiled_copy, const TiledCopyB& g2sB_tiled_copy,
     uint32_t consumer
 ) {
@@ -170,9 +170,11 @@ __device__ __forceinline__ uint32_t load_AB(
 
     CUTE_UNROLL
     for (uint32_t i=0, j=threadIdx.x / G2SColPerCTA; i < size(rIndex); ++i, j+=G2SRowPerCTA) {
-        auto gAtA = gA(make_coord(_, _), make_coord(rIndex(i), consumer));
-        auto pSgA = g2sA_thr_copy.partition_S(gAtA);
-        copy(g2sA_tiled_copy, pSgA(make_coord(_, _), _, 0), pDsA(make_coord(_, _), j, _, cur_stage));
+        if (execute_g2s_warp[i]) {
+            auto gAtA = gA(make_coord(_, _), make_coord(rIndex(i), consumer));
+            auto pSgA = g2sA_thr_copy.partition_S(gAtA);
+            copy(g2sA_tiled_copy, pSgA(make_coord(_, _), _, 0), pDsA(make_coord(_, _), j, _, cur_stage));
+        }
     }
     copy(g2sB_tiled_copy, pSgB(make_coord(_, _), _, _, cur_stage), pDsB(make_coord(_, _), _, _, cur_stage));
 
@@ -312,8 +314,8 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     //
     // prologue, load A & B
     //
-    uint8_t producer = 0;
-    uint8_t consumer = 0;
+    uint32_t producer = 0;
+    uint32_t consumer = 0;
 
     Tensor gA = zipped_divide(mA, g2sA_tv_tiler{});
     Tensor gB = local_tile(mB, g2sB_tv_tiler{}, make_coord(bidy, _));
@@ -328,7 +330,10 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     // fill the pipeline
     CUTE_UNROLL
     for (uint32_t i=0; i < Pipeline - 1; i++) {
-        consumer = load_AB(gA, pDsA, pDsB, pSgB, skip_helper.rIndex, g2sA_thr_copy, g2sA_tiled_copy{}, g2sB_tiled_copy{}, consumer);
+        consumer = load_AB(
+            gA, pDsA, pDsB, pSgB, skip_helper.rIndex, skip_helper.execute_g2s_warp,
+            g2sA_thr_copy, g2sA_tiled_copy{}, g2sB_tiled_copy{}, consumer
+        );
     }
 
     //

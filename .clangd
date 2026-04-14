@@ -8,4 +8,4 @@ CompileFlags:
   Add:
     - -xcuda
     - --cuda-path=/usr/local/cuda
-    - --cuda-gpu-arch=sm_80
+    - --cuda-gpu-arch=sm_89
