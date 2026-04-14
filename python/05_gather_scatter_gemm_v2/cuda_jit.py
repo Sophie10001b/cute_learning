@@ -62,7 +62,7 @@ def _jit_gather_scatter_gemm_module(
         "gather_scatter_gemm_sm80_sm120",
         *args,
         cuda_files=[str(ROOT_PATH / "include" / "gather_scatter_gemm_sm80_sm120.cuh")],
-        cuda_wrappers=[("gather_scatter_gemm_sm80_sm120", f"GatherScatterGEMMKernelSM80SM120<{args}>::run")],
+        cuda_wrappers=[("gather_scatter_gemm_sm80_sm120", f"GatherScatterGEMMKernel<{args}>::run")],
         extra_cflags=DEFAULT_CFLAGS,
         extra_cuda_cflags=DEFAULT_CUDA_CFLAGS,
         extra_include_paths=THIRD_PARTY_HEADER_DIRS,
@@ -178,7 +178,7 @@ if __name__ == "__main__":
     A = torch.rand((1, M, K), dtype=dtype, device=device)
     B = torch.rand((N, K), dtype=dtype, device=device)
     Mask = torch.rand((1, M, NG), device=device) > 0.5
-    D = torch.zeros((1, M, N), dtype=dtype, device=device)
+    D = torch.zeros((M, N), dtype=dtype, device=device)
 
     D_cute = gather_scatter_gemm_cute(
         deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5

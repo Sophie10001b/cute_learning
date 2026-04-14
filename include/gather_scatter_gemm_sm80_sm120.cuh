@@ -23,12 +23,6 @@ namespace {
 #define SMEM_SIZE 102400
 #endif
 
-constexpr uint32_t numWarps = 4;
-constexpr uint32_t threadsPerCTA = numWarps * device::kWarpThreads;
-constexpr uint32_t G2SRowPerWarp = 4;
-constexpr uint32_t G2SRowPerCTA = G2SRowPerWarp * numWarps;
-constexpr uint32_t G2SColPerCTA = threadsPerCTA / G2SRowPerCTA;
-constexpr uint32_t MMARowPerWarp = 16;
 namespace cg = cooperative_groups;
 
 // layout for smem
@@ -65,26 +59,67 @@ struct SkipHelper {
     uint32_t rIndex[kG2SIter];
 };
 
-template <uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kG2SRowPerCTA, uint32_t kPipeline, typename DType>
-struct MMAHelper {
+template <uint32_t kBM, uint32_t kBK, uint32_t kWarps=4, uint32_t kBytes=2>
+struct WarpLayoutTraits {
+    static constexpr uint32_t threadsPerCTA = kWarps * device::kWarpThreads;
+    static constexpr uint32_t MMARowPerWarp = 16;
+
+    // infer the G2SColPerCTA
+    // cp_async.cg only support 16B copy
+    static constexpr uint32_t G2SColPerCTA = kBK * kBytes / 16;
+    static constexpr uint32_t G2SRowPerCTA = threadsPerCTA / G2SColPerCTA;
+    static constexpr uint32_t G2SRowPerWarp = G2SRowPerCTA / kWarps;
+
+    // mma warp layout
+    static constexpr uint32_t MMARow = kBM / 16 > kWarps ? kWarps : kBM / 16;
+    static constexpr uint32_t MMACol = kWarps / MMARow;
+};
+
+
+template <
+    uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kPipeline,
+    class WarpLayoutTraits_, typename DType
+>
+struct MmaTraits {
+    static constexpr uint32_t BM = kBM;
+    static constexpr uint32_t BN = kBN;
+    static constexpr uint32_t BK = kBK;
+    static constexpr uint32_t Pipeline = kPipeline;
+
+    static constexpr uint32_t G2SColPerCTA = WarpLayoutTraits_::G2SColPerCTA;
+    static constexpr uint32_t G2SRowPerCTA = WarpLayoutTraits_::G2SRowPerCTA;
+    static constexpr uint32_t G2SRowPerWarp = WarpLayoutTraits_::G2SRowPerWarp;
+    static constexpr uint32_t threadsPerCTA = WarpLayoutTraits_::threadsPerCTA;
+    static constexpr uint32_t MMARowPerWarp = WarpLayoutTraits_::MMARowPerWarp;
+
+    template <uint32_t NK>
+    static constexpr auto get_smem_swizzle() {
+        if constexpr (NK < 64) return cute::GMMA::Layout_K_SW64_Atom<DType>{};
+        else return cute::GMMA::Layout_K_SW128_Atom<DType>{};
+    }
+
     // smem layout
     using sALayout = decltype(cute::tile_to_shape(
-        cute::GMMA::Layout_K_SW128_Atom<DType>{},
+        decltype(get_smem_swizzle<BK>()){},
         cute::make_shape(cute::Int<kBM>{}, cute::Int<kBK>{}, cute::Int<kPipeline>{}),
         cute::make_step(cute::_1{}, cute::_0{}, cute::_2{})
     ));
     using sBLayout = decltype(cute::tile_to_shape(
-        cute::GMMA::Layout_K_SW128_Atom<DType>{},
+        decltype(get_smem_swizzle<BK>()){},
         cute::make_shape(cute::Int<kBN>{}, cute::Int<kBK>{}, cute::Int<kPipeline>{}),
         cute::make_step(cute::_1{}, cute::_0{}, cute::_2{})
     ));
+    using SharedStorage = SharedMemory<DType, sALayout, sBLayout>;
+    static constexpr size_t smem_size = sizeof(SharedStorage);
 
     // atom
-    static constexpr uint32_t g2s_copy_width = (kBK / G2SColPerCTA) * sizeof(DType);
-    using g2s_copy_type = CopyWidthToType<g2s_copy_width>::type;
-    using g2sA_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL<g2s_copy_type>>;
+    static constexpr uint32_t g2s_copy_width = (BK / G2SColPerCTA) * sizeof(DType);
+    static_assert(g2s_copy_width == 16, "cp.async.cg requires 16B per-thread copy");
+
+    using g2s_copy_type = typename CopyWidthToType<g2s_copy_width>::type;
+    using g2sA_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<g2s_copy_type>, DType>;
     using s2rA_atom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, DType>;
-    using g2sB_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL<g2s_copy_type>>;
+    using g2sB_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<g2s_copy_type>, DType>;
     using s2rB_atom = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, DType>;
     using mma_atom = cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>;
 
@@ -115,6 +150,11 @@ struct MMAHelper {
     using g2sB_tiled_copy = decltype(cute::make_tiled_copy(
         g2sB_atom{}, g2sB_thr_layout{}, g2sB_val_layout{}
     ));
+
+    // mma & ldmatrix layout
+    using tiled_mma = decltype(cute::make_tiled_mma(mma_atom{}));
+    using s2rA_tiled_copy = decltype(cute::make_tiled_copy_A(s2rA_atom{}, tiled_mma{}));
+    using s2rB_tiled_copy = decltype(cute::make_tiled_copy_B(s2rB_atom{}, tiled_mma{}));
 };
 
 constexpr uint32_t next_pow_of_2(uint32_t x) {
@@ -152,26 +192,27 @@ __device__ __forceinline__ uint2 l2_swizzle(
     }
 }
 
+// mainloop func
 template <
-typename gATensor, typename gBTensor, typename sATensor, typename sBTensor,
-typename pDsATensor, typename pDsBTensor, typename pSgBTensor,
-typename ThrCopyA, typename TiledCopyA, typename TiledCopyB,
-typename sAtATensor, typename sBtBTensor,
-typename idxTensor, uint32_t kPipeline
+    typename gATensor,
+    typename pDsATensor, typename pDsBTensor, typename pSgBTensor,
+    typename ThrCopyA, typename TiledCopyA, typename TiledCopyB,
+    uint32_t kPipeline, uint32_t G2SRowPerCTA, uint32_t G2SColPerCTA, uint32_t kG2SIter
 >
 __device__ __forceinline__ uint32_t load_AB(
     const gATensor& gA,
-    const pDsATensor& pDsA, const pDsBTensor& pDsB, const pSgBTensor& pSgB, const idxTensor& rIndex, const uint8_t* execute_g2s_warp,
+    const pDsATensor& pDsA, const pDsBTensor& pDsB, const pSgBTensor& pSgB,
+    const uint32_t* rIndex, const uint8_t* execute_g2s_warp,
     const ThrCopyA& g2sA_thr_copy, const TiledCopyA& g2sA_tiled_copy, const TiledCopyB& g2sB_tiled_copy,
-    uint32_t consumer
+    uint32_t producer
 ) {
     using namespace cute;
-    const uint32_t cur_stage = consumer % kPipeline;
+    const uint32_t cur_stage = producer % kPipeline;
 
     CUTE_UNROLL
-    for (uint32_t i=0, j=threadIdx.x / G2SColPerCTA; i < size(rIndex); ++i, j+=G2SRowPerCTA) {
+    for (uint32_t i=0, j=threadIdx.x / G2SColPerCTA; i < kG2SIter; ++i, j+=G2SRowPerCTA) {
         if (execute_g2s_warp[i]) {
-            auto gAtA = gA(make_coord(_, _), make_coord(rIndex(i), consumer));
+            auto gAtA = gA(make_coord(_, _), make_coord(rIndex[i], producer));
             auto pSgA = g2sA_thr_copy.partition_S(gAtA);
             copy(g2sA_tiled_copy, pSgA(make_coord(_, _), _, 0), pDsA(make_coord(_, _), j, _, cur_stage));
         }
@@ -179,15 +220,25 @@ __device__ __forceinline__ uint32_t load_AB(
     copy(g2sB_tiled_copy, pSgB(make_coord(_, _), _, _, cur_stage), pDsB(make_coord(_, _), _, _, cur_stage));
 
     cute::cp_async_fence();
-    return consumer + 1;
+    return producer + 1;
 }
+
+template <
+    typename TiledCopyA, typename TiledCopyB
+>
+__device__ __forceinline__ uint32_t issue_mma(
+    const uint8_t* execute_mma_warp,
+    const TiledCopyA& s2rA_tiled_copy, const TiledCopyB& s2rB_tiled_copy,
+    uint32_t consumer
+) {}
+
+
 
 // main kernel func
 template <
-uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kL2Group, uint32_t kPipeline,
-uint32_t kN, uint32_t kK, uint32_t kNG, uint32_t kNGIter,
-typename kMMAHelper, typename DType,
-uint32_t kG2SRowPerCTA, uint32_t, uint32_t kMMARow
+    uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kL2Group, uint32_t kPipeline,
+    uint32_t kN, uint32_t kK, uint32_t kNG, uint32_t kNGIter,
+    class WarpLayoutTraits_, class MmaTraits_, typename DType
 >
 __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams params) {
     using namespace cute;
@@ -201,13 +252,30 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     constexpr uint32_t BK = kBK;
     constexpr uint32_t Pipeline = kPipeline;
 
+    constexpr uint32_t G2SColPerCTA = WarpLayoutTraits_::G2SColPerCTA;
+    constexpr uint32_t G2SRowPerCTA = WarpLayoutTraits_::G2SRowPerCTA;
+    constexpr uint32_t MMARowPerWarp = WarpLayoutTraits_::MMARowPerWarp;
+    constexpr uint32_t threadsPerCTA = WarpLayoutTraits_::threadsPerCTA;
+    constexpr uint32_t MMARow = WarpLayoutTraits_::MMARow;
+    constexpr uint32_t MMACol = WarpLayoutTraits_::MMACol;
+
+    using sALayout = typename MmaTraits_::sALayout;
+    using sBLayout = typename MmaTraits_::sBLayout;
+    using g2sA_tv_tiler = typename MmaTraits_::g2sA_tv_tiler;
+    using g2sB_tv_tiler = typename MmaTraits_::g2sB_tv_tiler;
+    using g2sA_tiled_copy = typename MmaTraits_::g2sA_tiled_copy;
+    using g2sB_tiled_copy = typename MmaTraits_::g2sB_tiled_copy;
+    using mma_atom = typename MmaTraits_::mma_atom;
+    using tiled_mma = typename MmaTraits_::tiled_mma;
+
+
     // (cdiv(M, BM), cdiv(N, BN), SplitK)
     const uint32_t tidx = threadIdx.x;
-    const uint32_t NBM = cutlass::ceil_div(M, BM);
-    const uint32_t NBN = gridDim.x / NBM;
+    const uint32_t NBM = gridDim.x;
+    const uint32_t NBN = gridDim.y;
     const uint32_t SplitK = gridDim.z;
     const uint2 tile_idx = l2_swizzle<kL2Group>(
-        blockIdx.x % NBM, blockIdx.x / NBM,
+        blockIdx.x, blockIdx.y,
         NBM, NBN
     );
     const uint32_t bidx = tile_idx.x;
@@ -219,19 +287,9 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     const uint32_t base_off_m = bidx * BM;
     const uint32_t base_off_n = bidy * BN;
     const uint32_t base_off_k = bidz * BK;
-    const uint32_t MMARowPerCTA = MMARowPerWarp * kMMARow;
+    const uint32_t MMARowPerCTA = MMARowPerWarp * MMARow;
 
     const uint32_t thread_off_m = base_off_m + tidx / G2SColPerCTA;
-
-    using sALayout = typename kMMAHelper::sALayout;
-    using sBLayout = typename kMMAHelper::sBLayout;
-    using g2sA_tv_tiler = typename kMMAHelper::g2sA_tv_tiler;
-    using g2sB_tv_tiler = typename kMMAHelper::g2sB_tv_tiler;
-    using g2sA_tiled_copy = typename kMMAHelper::g2sA_tiled_copy;
-    using g2sB_tiled_copy = typename kMMAHelper::g2sB_tiled_copy;
-    using mma_atom = typename kMMAHelper::mma_atom;
-
-    auto tiled_mma = make_tiled_mma(mma_atom{});
 
     //
     // prepare tensors and smem layout
@@ -284,7 +342,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     // for block skip, the bdimy = 8, NG = 2, NGIter = 4, with coord (bidy // NGIter, ...)
     //
     constexpr uint32_t G2SIter = BM / G2SRowPerCTA;
-    constexpr uint32_t MMAIter = BM / (MMARowPerWarp * kMMARow);
+    constexpr uint32_t MMAIter = BM / (MMARowPerWarp * MMARow);
     SkipHelper<G2SIter, MMAIter> skip_helper;
     CUTE_UNROLL
     for (uint32_t i=0, off=thread_off_m; i < G2SIter; ++i, off+=G2SRowPerCTA) {
@@ -293,15 +351,15 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     }
 
     // check if early exit current block or warp's g2s load
-    skip_helper.execute_cta = 1;
+    skip_helper.execute_cta = 0;
     cg::thread_block this_cta = cg::this_thread_block();
     auto this_cta_tile = cg::tiled_partition<threadsPerCTA>(this_cta);
     CUTE_UNROLL
     for (uint32_t i=0; i < G2SIter; ++i) {
-        skip_helper.execute_cta &= skip_helper.rMask[i];
+        skip_helper.execute_cta |= skip_helper.rMask[i];
         skip_helper.execute_g2s_warp[i] = static_cast<uint8_t>(__any_sync(0xffffffff, static_cast<int>(skip_helper.rMask[i] > 0)));
     }
-    skip_helper.execute_cta = cg::reduce(this_cta_tile, skip_helper.execute_cta, cg::bit_and<uint8_t>{});
+    skip_helper.execute_cta = cg::reduce(this_cta_tile, skip_helper.execute_cta, cg::bit_or<uint8_t>{});
     if (skip_helper.execute_cta == 0) return;
 
     // check if mma need execute
@@ -320,8 +378,8 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     Tensor gA = zipped_divide(mA, g2sA_tv_tiler{});
     Tensor gB = local_tile(mB, g2sB_tv_tiler{}, make_coord(bidy, _));
 
-    ThrCopy g2sA_thr_copy = g2sA_tiled_copy{}.get_slice(tidx % G2SColPerCTA);
-    ThrCopy g2sB_thr_copy = g2sB_tiled_copy{}.get_slice(tidx);
+    auto g2sA_thr_copy = g2sA_tiled_copy{}.get_slice(tidx % G2SColPerCTA);
+    auto g2sB_thr_copy = g2sB_tiled_copy{}.get_slice(tidx);
 
     auto pDsA = g2sA_thr_copy.partition_D(sA);
     auto pDsB = g2sB_thr_copy.partition_D(sB);
@@ -330,16 +388,36 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     // fill the pipeline
     CUTE_UNROLL
     for (uint32_t i=0; i < Pipeline - 1; i++) {
-        consumer = load_AB(
+        producer = load_AB<
+            decltype(gA),
+            decltype(pDsA),
+            decltype(pDsB),
+            decltype(pSgB),
+            decltype(g2sA_thr_copy),
+            g2sA_tiled_copy,
+            g2sB_tiled_copy,
+            Pipeline,
+            G2SRowPerCTA,
+            G2SColPerCTA,
+            G2SIter
+        >(
             gA, pDsA, pDsB, pSgB, skip_helper.rIndex, skip_helper.execute_g2s_warp,
-            g2sA_thr_copy, g2sA_tiled_copy{}, g2sB_tiled_copy{}, consumer
+            g2sA_thr_copy, g2sA_tiled_copy{}, g2sB_tiled_copy{},
+            producer
         );
     }
 
     //
     // mainloop, issue s2r & mma
     //
-    ThrMMA thr_mma = tiled_mma.get_slice(tidx);
+    ThrMMA thr_mma = tiled_mma{}.get_slice(tidx);
+    auto rA = thr_mma.partition_fragment_A(sA(_, _, _0{}));
+    auto rB = thr_mma.partition_fragment_B(sB(_, _, _0{}));
+    
+    if (tidx == 0 && (bidx + bidy + bidz == 0)) {
+        cute::print(rA);
+        cute::print(rB);
+    }
 
 }
 
@@ -428,19 +506,16 @@ struct GatherScatterGEMMKernel {
         };
 
         // host-side static tiling
-        MMAHelper<kBM, kBN, kBK, G2SRowPerCTA, kPipeline, DType> mma_helper;
-        using sALayout = decltype(mma_helper.sALayout);
-        using sBLayout = decltype(mma_helper.sBLayout);
-
-        static constexpr size_t smem_size = size_t(sizeof(SharedMemory<DType, sALayout, sBLayout>));
+        using warp_layout_traits = WarpLayoutTraits<kBM, kBK, 4, sizeof(DType)>;
+        using mma_traits = MmaTraits<kBM, kBN, kBK, kPipeline, warp_layout_traits, DType>;
         constexpr auto kernel = gather_scatter_gemm_kernel<
             kBM, kBN, kBK, 4, kPipeline, kN, kK, kNG, kNGIter,
-            mma_helper, DType, G2SRowPerCTA, kBM / MMARowPerWarp
+            warp_layout_traits, mma_traits, DType
         >;
 
         const dim3 grid_size = {cute::ceil_div(params.M, kBM), cute::ceil_div(kN, kBN), kSplitK};
-        const dim3 block_size = {threadsPerCTA, 1, 1};
-        LaunchKernel(grid_size, block_size, device.unwrap(), smem_size).enable_pdl(kUsePDL)(kernel, params);
+        const dim3 block_size = {warp_layout_traits::threadsPerCTA, 1, 1};
+        LaunchKernel(grid_size, block_size, device.unwrap(), mma_traits::smem_size).enable_pdl(kUsePDL)(kernel, params);
     }
 };
 
