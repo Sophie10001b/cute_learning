@@ -727,8 +727,8 @@ struct GatherScatterGEMMKernel {
     ) {
         using namespace host;
         RuntimeCheck(
-            sparsity >= 0 && sparsity < 1,
-            "sparsity must be in [0, 1)"
+            sparsity >= 0 && sparsity <= 1,
+            "sparsity must be in [0, 1]"
         );
 
         auto M = SymbolicSize{"num_tokens"};
