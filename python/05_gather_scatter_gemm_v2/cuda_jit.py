@@ -117,7 +117,7 @@ def gather_scatter_gemm_cute(
         
         SplitK = 1
         base_tile_num = cdiv(M, BM) * cdiv(N, BN)
-        if base_tile_num < num_sm:
+        if base_tile_num < num_sm and K >= 8 * BK:
             min_waste = 1.0
             best_split_k = 2
             for split_k in [2, 4, 8]:
