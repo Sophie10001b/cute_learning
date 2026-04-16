@@ -67,6 +67,32 @@ struct CopyWidthToType<16> {
     using type = cute::uint128_t;
 };
 
+template <typename DType>
+struct AccumlatorPack2;
+
+template <>
+struct AccumlatorPack2<fp16_t> {
+    __device__ __forceinline__ uint32_t operator()(fp32_t* addr) {
+        uint32_t d;
+        asm volatile("cvt.rn.f16x2.f32 %0, %1, %2;"
+            : "=r"(d)
+            : "f"(addr[0]), "f"(addr[1]));
+        return d;
+    }
+    
+};
+
+template <>
+struct AccumlatorPack2<bf16_t> {
+    __device__ __forceinline__ uint32_t operator()(fp32_t* addr) {
+        uint32_t d;
+        asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;"
+            : "=r"(d)
+            : "f"(addr[0]), "f"(addr[1]));
+        return d;
+    }
+};
+
 template <uint32_t kG2SIter, uint32_t kMMAIter>
 struct SkipHelper {
     uint8_t execute_cta;
@@ -74,8 +100,8 @@ struct SkipHelper {
     uint8_t execute_mma_warp[kMMAIter];
 
     uint8_t rMask[kG2SIter];
-    uint8_t rMask_mma[kMMAIter];
-    uint32_t rIndex[kG2SIter];
+    uint32_t rIndex_ld[kG2SIter];
+    uint32_t rIndex_st[2 * kMMAIter]; // (8,8),2,1 for rD accumlator layout
 };
 
 template <uint32_t kBM, uint32_t kBK, uint32_t kWarps=4, uint32_t kBytes=2>
@@ -488,7 +514,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     CUTE_UNROLL
     for (uint32_t i=0, off=thread_off_m; i < G2SIter; ++i, off+=G2SRowPerCTA) {
         skip_helper.rMask[i] = off < M ? mMask(make_coord(bidy / NGIter, off)) : 0;
-        skip_helper.rIndex[i] = off < M ? mIndex(make_coord(bidy / NGIter, off)) : 0;
+        skip_helper.rIndex_ld[i] = off < M ? mIndex(make_coord(bidy / NGIter, off)) : 0;
     }
 
     // check if early exit current block or warp's g2s load
@@ -504,10 +530,17 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     if (skip_helper.execute_cta == 0) return;
 
     // check if mma need execute
+    // mma rD layout --> (8, 8), 2, 1, each warp's thread handle 2 row: lane_id / 4 and lane_id / 4 + 8
     CUTE_UNROLL
-    for (uint32_t i=0, off=base_off_m + tidx / (threadsPerCTA / MMARowPerCTA); i < MMAIter; ++i, off+=MMARowPerCTA) {
-        skip_helper.rMask_mma[i] = off < M ? mMask(make_coord(bidy / NGIter, off)) : 0;
-        skip_helper.execute_mma_warp[i] = static_cast<uint8_t>(__any_sync(0xffffffff, static_cast<int>(skip_helper.rMask_mma[i] > 0)));
+    for (
+        uint32_t i=0,
+        off=base_off_m + (warp_id / MMACol) * MMARowPerWarp + lane_id / 4;
+        i < MMAIter;
+        i+=2, off+=MMARowPerCTA
+    ) {
+        skip_helper.rIndex_st[i] = off < M ? mIndex(make_coord(bidy / NGIter, off)) : -1;
+        skip_helper.rIndex_st[i+1] = off + 8 < M ? mIndex(make_coord(bidy / NGIter, off + 8)) : -1;
+        skip_helper.execute_mma_warp[i] = static_cast<uint8_t>(__any_sync(0xffffffff, static_cast<int>(skip_helper.rIndex_st[i] >= 0 && skip_helper.rIndex_st[i+1] >= 0)));
     }
 
     //
@@ -549,7 +582,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
             G2SColPerCTA,
             G2SIter
         >(
-            gA, pDsA, pDsB, pSgB, skip_helper.rIndex, skip_helper.execute_g2s_warp,
+            gA, pDsA, pDsB, pSgB, skip_helper.rIndex_ld, skip_helper.execute_g2s_warp,
             g2sA_thr_copy, g2sA_tiled_copy{}, g2sB_tiled_copy{},
             producer, base_off_k_tile
         );
@@ -588,7 +621,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
             G2SColPerCTA,
             G2SIter
         >(
-            gA, pDsA, pDsB, pSgB, skip_helper.rIndex, skip_helper.execute_g2s_warp,
+            gA, pDsA, pDsB, pSgB, skip_helper.rIndex_ld, skip_helper.execute_g2s_warp,
             g2sA_thr_copy, g2sA_tiled_copy{}, g2sB_tiled_copy{},
             producer, base_off_k_tile
         );
@@ -637,9 +670,27 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
 
     // epilogue
     if constexpr (SplitK == 1) {
-        ElementWiseActivation<decltype(rD), kAct>{}(rD);
-
         // retile rD to warp scatter layout, then write back based on half2, etc.
+        ElementWiseActivation<decltype(rD), kAct>{}(rD);
+        uint32_t mD_col_idx = base_off_n + (warp_id % MMACol) * 8 + lane_id % 4;
+        CUTE_UNROLL
+        for (uint32_t i=0; i < size<1>(rD); ++i) {
+            CUTE_UNROLL
+            for (uint32_t j=0; j < size<2>(rD); ++j) {
+                if (skip_helper.rIndex_st[i] >= 0) {
+                    uint32_t d_pack_0 = AccumlatorPack2<DType>{}(&rD(make_coord(0, 0), i, j));
+                    *reinterpret_cast<uint32_t*>(&mD(skip_helper.rIndex_st[i], mD_col_idx + j * MMACol * 8)) = d_pack_0;
+                }
+                if (skip_helper.rIndex_st[i+1] >= 0) {
+                    uint32_t d_pack_1 = AccumlatorPack2<DType>{}(&rD(make_coord(1, 0), i, j));
+                    *reinterpret_cast<uint32_t*>(&mD(skip_helper.rIndex_st[i+1], mD_col_idx + j * MMACol * 8)) = d_pack_1;
+                }
+            }
+        }
+    }
+    else {
+        // atomic add for split-k
+        
     }
 
     

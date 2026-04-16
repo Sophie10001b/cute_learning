@@ -154,8 +154,8 @@ def ref_program(
     activation: Optional[str]="identity",
     estimate_sparsity: Optional[float]=0.5,
 ) -> torch.Tensor:
-    D = A @ B.T
-    D = rearrange(D, 'b t (ng d) -> b t ng d', ng=Mask.shape[-1])
+    D = A.flatten(0, 1) @ B.T
+    D = rearrange(D, '(b t) (ng d) -> b t ng d', b=A.shape[0], ng=Mask.shape[-1])
     if Mask.dim() == 2: Mask = Mask.unsqueeze(-1) # [B, T, NG]
 
     D.masked_fill_(Mask.logical_not()[:, :, :, None], 0)
@@ -183,3 +183,11 @@ if __name__ == "__main__":
     D_cute = gather_scatter_gemm_cute(
         deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5
     )
+    D_ref = ref_program(
+        deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5
+    )
+
+    diff = (D_cute - D_ref).abs()
+    max_diff = diff.max()
+    mean_diff = diff.mean()
+    print(f"max_diff: {max_diff.item()}, mean_diff: {mean_diff.item()}")
