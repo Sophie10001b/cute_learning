@@ -149,28 +149,32 @@ def gather_scatter_gemm_cute(
 def ref_program(
     A: torch.Tensor,
     B: torch.Tensor,
-    Mask: torch.Tensor,
+    Mask: Optional[torch.Tensor]=None,
     D: Optional[torch.Tensor]=None,
     activation: Optional[str]="identity",
     estimate_sparsity: Optional[float]=0.5,
 ) -> torch.Tensor:
     D = A.flatten(0, 1) @ B.T
-    D = rearrange(D, '(b t) (ng d) -> b t ng d', b=A.shape[0], ng=Mask.shape[-1])
-    if Mask.dim() == 2: Mask = Mask.unsqueeze(-1) # [B, T, NG]
+    if Mask is not None:
+        D = rearrange(D, '(b t) (ng d) -> b t ng d', b=A.shape[0], ng=Mask.shape[-1])
+        if Mask.dim() == 2: Mask = Mask.unsqueeze(-1) # [B, T, NG]
 
-    D.masked_fill_(Mask.logical_not()[:, :, :, None], 0)
+        D.masked_fill_(Mask.logical_not()[:, :, :, None], 0)
+        D = rearrange(D, 'b t ng d -> b t (ng d)')
+    else:
+        D = rearrange(D, '(b t) d -> b t d', b=A.shape[0])
 
     if activation == 'silu': D = D * torch.sigmoid(D)
     elif activation == 'relu': D = torch.relu(D)
 
-    return rearrange(D, 'b t ng d -> b t (ng d)')
+    return D
 
 
 if __name__ == "__main__":
     device = 'cuda:0'
     dtype = torch.float16
 
-    M = 4095
+    M = 4096
     N = 4096
     K = 4096
     NG = 32
