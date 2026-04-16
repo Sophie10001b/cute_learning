@@ -170,13 +170,13 @@ if __name__ == "__main__":
     device = 'cuda:0'
     dtype = torch.float16
 
-    M = 4096
+    M = 4095
     N = 4096
     K = 4096
     NG = 32
 
-    A = torch.rand((1, M, K), dtype=dtype, device=device)
-    B = torch.rand((N, K), dtype=dtype, device=device)
+    A = torch.rand((1, M, K), dtype=dtype, device=device) * 0.01
+    B = torch.rand((N, K), dtype=dtype, device=device) * 0.01
     Mask = torch.rand((1, M, NG), device=device) > 0.5
     D = torch.zeros((M, N), dtype=dtype, device=device)
 

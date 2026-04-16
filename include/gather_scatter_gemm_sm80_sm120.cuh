@@ -72,11 +72,11 @@ struct AccumlatorPack2;
 
 template <>
 struct AccumlatorPack2<fp16_t> {
-    __device__ __forceinline__ uint32_t operator()(fp32_t* addr) {
+    __device__ __forceinline__ uint32_t operator()(fp32_t odd, fp32_t even) {
         uint32_t d;
         asm volatile("cvt.rn.f16x2.f32 %0, %1, %2;"
             : "=r"(d)
-            : "f"(addr[1]), "f"(addr[0]));
+            : "f"(odd), "f"(even));
         return d;
     }
     
@@ -84,37 +84,11 @@ struct AccumlatorPack2<fp16_t> {
 
 template <>
 struct AccumlatorPack2<bf16_t> {
-    __device__ __forceinline__ uint32_t operator()(fp32_t* addr) {
+    __device__ __forceinline__ uint32_t operator()(fp32_t odd, fp32_t even) {
         uint32_t d;
         asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;"
             : "=r"(d)
-            : "f"(addr[1]), "f"(addr[0]));
-        return d;
-    }
-};
-
-template <typename DType>
-struct AccumlatorPack2Rev;
-
-template <>
-struct AccumlatorPack2Rev<fp16_t> {
-    __device__ __forceinline__ uint32_t operator()(fp32_t* addr) {
-        uint32_t d;
-        asm volatile("cvt.rn.f16x2.f32 %0, %1, %2;"
-            : "=r"(d)
-            : "f"(addr[0]), "f"(addr[1]));
-        return d;
-    }
-    
-};
-
-template <>
-struct AccumlatorPack2Rev<bf16_t> {
-    __device__ __forceinline__ uint32_t operator()(fp32_t* addr) {
-        uint32_t d;
-        asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;"
-            : "=r"(d)
-            : "f"(addr[0]), "f"(addr[1]));
+            : "f"(odd), "f"(even));
         return d;
     }
 };
@@ -709,11 +683,11 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
             CUTE_UNROLL
             for (uint32_t j=0; j < size<2>(rD); ++j) {
                 if (skip_helper.rMask_st[i*2]) {
-                    uint32_t d_pack_0 = AccumlatorPack2<DType>{}(&rD(make_coord(0, 0), i, j));
+                    uint32_t d_pack_0 = AccumlatorPack2<DType>{}(rD(make_coord(1, 0), i, j), rD(make_coord(0, 0), i, j));
                     *reinterpret_cast<uint32_t*>(&mD(skip_helper.rIndex_st[i*2], mD_col_idx + j * MMACol * 8)) = d_pack_0;
                 }
                 if (skip_helper.rMask_st[i*2+1]) {
-                    uint32_t d_pack_1 = AccumlatorPack2Rev<DType>{}(&rD(make_coord(1, 0), i, j));
+                    uint32_t d_pack_1 = AccumlatorPack2<DType>{}(rD(make_coord(1, 1), i, j), rD(make_coord(0, 1), i, j));
                     *reinterpret_cast<uint32_t*>(&mD(skip_helper.rIndex_st[i*2+1], mD_col_idx + j * MMACol * 8)) = d_pack_1;
                 }
             }
