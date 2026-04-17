@@ -162,7 +162,7 @@ struct MmaTraits {
         cute::make_step(cute::_1{}, cute::_0{}, cute::_2{})
     ));
     using sDLayout = decltype(cute::tile_to_shape(
-        decltype(cute::GMMA::Layout_K_SW32_Atom<DType>{}){},
+        decltype(get_smem_swizzle<BN>()){},
         cute::make_shape(cute::Int<kBM>{}, cute::Int<kBN>{}),
         cute::make_step(cute::_1{}, cute::_0{})
     ));
@@ -181,8 +181,12 @@ struct MmaTraits {
     using g2sB_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<g2s_copy_type>, DType>;
     using s2rB_atom = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, DType>;
     using mma_atom = cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>;
+
+    static constexpr uint32_t s2g_copy_width = (BN / G2SColPerCTA) * sizeof(DType);
+
+    using s2g_copy_type = typename CopyWidthToType<s2g_copy_width>::type;
     using r2sD_atom = cute::Copy_Atom<cute::UniversalCopy<uint32_t>, DType>;
-    using s2gD_atom = cute::Copy_Atom<cute::UniversalCopy<cute::uint128_t>, DType>;
+    using s2gD_atom = cute::Copy_Atom<cute::UniversalCopy<s2g_copy_type>, DType>;
 
     // tv layout g2sA
     using g2sA_thr_layout = decltype(cute::make_ordered_layout(
@@ -690,6 +694,8 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
             s2rA_tiled_copy{}, s2rB_tiled_copy{}, tiled_mma{},
             consumer
         );
+
+        __syncthreads();
     }
 
     // drain the pipeline
@@ -712,6 +718,8 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
         s2rA_tiled_copy{}, s2rB_tiled_copy{}, tiled_mma{},
         consumer
     );
+
+    __syncthreads();
 
     // epilogue
     // r2s -> s2g, reinterpret the smem to BMxBK

@@ -105,7 +105,7 @@ def gather_scatter_gemm_cute(
     if BM >= int(M * estimate_sparsity): BM >>= 1
 
     if cc_major in (8, 12): # sm80-like warp mma
-        BM = min(128, max(16, BM))
+        BM = min(128, max(32, BM))
         BK = 64
         BN = min(G, 256)
         Pipeline = 3
@@ -174,24 +174,34 @@ if __name__ == "__main__":
     device = 'cuda:1'
     dtype = torch.float16
 
-    M = 4096
+    M = 4095
     N = 4096
-    K = 4096
-    NG = 32
+    K = 2048
+    G = 32
 
-    A = torch.rand((1, M, K), dtype=dtype, device=device)
-    B = torch.rand((N, K), dtype=dtype, device=device)
-    Mask = torch.rand((1, M, NG), device=device) > 0.5
-    D = torch.zeros((M, N), dtype=dtype, device=device)
+    import random
+    for _ in range(3):
+        sparsity = random.uniform(0.0, 0.9)
+        # M = random.randint(1024, 4096)
+        # N = random.choice([4096, 5120])
+        # K = random.choice([1024, 4096, 5120, 14336])
+        M = 4096
+        N = 5120
+        K = 5120
 
-    D_cute = gather_scatter_gemm_cute(
-        deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5
-    )
-    D_ref = ref_program(
-        deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5
-    )
+        A = torch.randn((1, M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        Mask = torch.rand((1, M, N // G), device=device) >= sparsity
+        D = torch.zeros((M, N), dtype=dtype, device=device)
 
-    diff = (D_cute - D_ref).abs()
-    max_diff = diff.max()
-    mean_diff = diff.mean()
-    print(f"max_diff: {max_diff.item()}, mean_diff: {mean_diff.item()}")
+        D_cute = gather_scatter_gemm_cute(
+            deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5
+        )
+        D_ref = ref_program(
+            deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5
+        )
+
+        diff = (D_cute - D_ref).abs()
+        max_diff = diff.max()
+        mean_diff = diff.mean()
+        print(f"max_diff: {max_diff.item()}, mean_diff: {mean_diff.item()}")
