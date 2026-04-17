@@ -46,9 +46,13 @@ __device__ __forceinline__ float expf_ftz(float x) {
 
 // layout for smem
 template <typename DType, class LayoutA, class LayoutB>
-struct SharedMemory {
+struct SharedMemoryAB {
     cute::ArrayEngine<DType, cute::cosize_v<LayoutA>> A;
     cute::ArrayEngine<DType, cute::cosize_v<LayoutB>> B;
+};
+template <typename DType, class LayoutD>
+struct SharedMemoryD {
+    cute::ArrayEngine<DType, cute::cosize_v<LayoutD>> D;
 };
 
 // helper
@@ -102,10 +106,10 @@ struct SkipHelper {
     uint8_t rMask[kG2SIter];
     uint32_t rIndex_ld[kG2SIter];
     uint8_t rMask_st[2 * kMMAIter]; // (8,8),2,1 for rD accumlator layout
-    uint32_t rIndex_st[2 * kMMAIter]; // (8,8),2,1 for rD accumlator layout
+    // uint32_t rIndex_st[2 * kMMAIter]; // (8,8),2,1 for rD accumlator layout
 };
 
-template <uint32_t kBM, uint32_t kBK, uint32_t kWarps=4, uint32_t kBytes=2>
+template <uint32_t kBM, uint32_t kBN, uint32_t kBK, uint32_t kWarps=4, uint32_t kBytes=2>
 struct WarpLayoutTraits {
     static constexpr uint32_t threadsPerCTA = kWarps * device::kWarpThreads;
     static constexpr uint32_t MMARowPerWarp = 16;
@@ -157,8 +161,15 @@ struct MmaTraits {
         cute::make_shape(cute::Int<kBN>{}, cute::Int<kBK>{}, cute::Int<kPipeline>{}),
         cute::make_step(cute::_1{}, cute::_0{}, cute::_2{})
     ));
-    using SharedStorage = SharedMemory<DType, sALayout, sBLayout>;
-    static constexpr size_t smem_size = sizeof(SharedStorage);
+    using sDLayout = decltype(cute::tile_to_shape(
+        decltype(cute::GMMA::Layout_K_SW32_Atom<DType>{}){},
+        cute::make_shape(cute::Int<kBM>{}, cute::Int<kBN>{}),
+        cute::make_step(cute::_1{}, cute::_0{})
+    ));
+
+    using SharedStorageAB = SharedMemoryAB<DType, sALayout, sBLayout>;
+    using SharedStorageD = SharedMemoryD<DType, sDLayout>;
+    static constexpr size_t smem_size = cute::max(sizeof(SharedStorageAB), sizeof(SharedStorageD));
 
     // atom
     static constexpr uint32_t g2s_copy_width = (BK / G2SColPerCTA) * sizeof(DType);
@@ -170,6 +181,8 @@ struct MmaTraits {
     using g2sB_atom = cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<g2s_copy_type>, DType>;
     using s2rB_atom = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, DType>;
     using mma_atom = cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>;
+    using r2sD_atom = cute::Copy_Atom<cute::UniversalCopy<uint32_t>, DType>;
+    using s2gD_atom = cute::Copy_Atom<cute::UniversalCopy<cute::uint128_t>, DType>;
 
     // tv layout g2sA
     using g2sA_thr_layout = decltype(cute::make_ordered_layout(
@@ -220,6 +233,21 @@ struct MmaTraits {
     ));
     using s2rA_tiled_copy = decltype(cute::make_tiled_copy_A(s2rA_atom{}, tiled_mma{}));
     using s2rB_tiled_copy = decltype(cute::make_tiled_copy_B(s2rB_atom{}, tiled_mma{}));
+    using r2sD_tiled_copy = decltype(cute::make_tiled_copy_C(r2sD_atom{}, tiled_mma{}));
+
+    // s2g layout, row-wise
+    using s2gD_thr_layout = decltype(cute::make_ordered_layout(
+        cute::make_shape(cute::_1{}, cute::Int<G2SColPerCTA>{}),
+        cute::make_step(cute::_1{}, cute::_0{})
+    ));
+    using s2gD_val_layout = decltype(cute::make_ordered_layout(
+        cute::make_shape(cute::_1{}, cute::Int<kBN / G2SColPerCTA>{}),
+        cute::make_step(cute::_1{}, cute::_0{})
+    ));
+    using s2gD_tv_tiler = decltype(cute::product_each(cute::shape(cute::raked_product(s2gD_thr_layout{}, s2gD_val_layout{}))));
+    using s2gD_tiled_copy = decltype(cute::make_tiled_copy(
+        s2gD_atom{}, s2gD_thr_layout{}, s2gD_val_layout{}
+    ));
 };
 
 struct GEMMParams {
@@ -429,6 +457,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
 
     using sALayout = typename MmaTraits_::sALayout;
     using sBLayout = typename MmaTraits_::sBLayout;
+    using sDLayout = typename MmaTraits_::sDLayout;
     using g2sA_tv_tiler = typename MmaTraits_::g2sA_tv_tiler;
     using g2sB_tv_tiler = typename MmaTraits_::g2sB_tv_tiler;
     using D_tv_tiler = typename MmaTraits_::D_tv_tiler;
@@ -438,6 +467,9 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     using tiled_mma = typename MmaTraits_::tiled_mma;
     using s2rA_tiled_copy = typename MmaTraits_::s2rA_tiled_copy;
     using s2rB_tiled_copy = typename MmaTraits_::s2rB_tiled_copy;
+    using r2sD_tiled_copy = typename MmaTraits_::r2sD_tiled_copy;
+    using s2gD_tiled_copy = typename MmaTraits_::s2gD_tiled_copy;
+    using s2gD_tv_tiler = typename MmaTraits_::s2gD_tv_tiler;
 
     // (cdiv(M, BM), cdiv(N, BN), SplitK)
     const uint32_t tidx = threadIdx.x;
@@ -490,18 +522,26 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     );
 
     extern __shared__ uint8_t shared_memory[];
-    using SharedMemory = SharedMemory<DType, sALayout, sBLayout>;
-    SharedMemory &smem = *reinterpret_cast<SharedMemory*>(shared_memory);
+    using SharedStorageAB = SharedMemoryAB<DType, sALayout, sBLayout>;
+    SharedStorageAB &smem_ab = *reinterpret_cast<SharedStorageAB*>(shared_memory);
+
+    using SharedStorageD = SharedMemoryD<DType, sDLayout>;
+    SharedStorageD &smem_d = *reinterpret_cast<SharedStorageD*>(shared_memory);
 
     Tensor sA = make_tensor(
-        make_smem_ptr(smem.A.begin()),
+        make_smem_ptr(smem_ab.A.begin()),
         make_shape(Int<BM>{}, Int<BK>{}, Int<Pipeline>{}),
         make_stride(Int<BK>{}, _1{}, Int<BK * BM>{})
     );
     Tensor sB = make_tensor(
-        make_smem_ptr(smem.B.begin()),
+        make_smem_ptr(smem_ab.B.begin()),
         make_shape(Int<BN>{}, Int<BK>{}, Int<Pipeline>{}),
         make_stride(Int<BK>{}, _1{}, Int<BK * BN>{})
+    );
+    Tensor sD = make_tensor(
+        make_smem_ptr(smem_d.D.begin()),
+        make_shape(Int<BM>{}, Int<BN>{}),
+        make_stride(Int<BN>{}, _1{})
     );
 
     //
@@ -542,8 +582,8 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     ) {
         skip_helper.rMask_st[i*2] = off < M ? mMask(make_coord(bidy / NGIter, off)) : 0;
         skip_helper.rMask_st[i*2+1] = off + 8 < M ? mMask(make_coord(bidy / NGIter, off + 8)) : 0;
-        skip_helper.rIndex_st[i*2] = off < M ? mIndex(make_coord(bidy / NGIter, off)) : 0;
-        skip_helper.rIndex_st[i*2+1] = off + 8 < M ? mIndex(make_coord(bidy / NGIter, off + 8)) : 0;
+        // skip_helper.rIndex_st[i*2] = off < M ? mIndex(make_coord(bidy / NGIter, off)) : 0;
+        // skip_helper.rIndex_st[i*2+1] = off + 8 < M ? mIndex(make_coord(bidy / NGIter, off + 8)) : 0;
         skip_helper.execute_mma_warp[i] = static_cast<uint8_t>(__any_sync(0xffffffff, static_cast<int>((skip_helper.rMask_st[i*2] > 0) || (skip_helper.rMask_st[i*2+1] > 0))));
     }
 
@@ -674,29 +714,78 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
     );
 
     // epilogue
+    // r2s -> s2g, reinterpret the smem to BMxBK
     if constexpr (SplitK == 1) {
-        // retile rD to warp scatter layout, then write back based on half2, etc.
         ElementWiseActivation<decltype(rD), kAct>{}(rD);
-        uint32_t mD_col_idx = base_off_n + (warp_id % MMACol) * 8 + (lane_id % 4) * 2;
+        auto r2sD_thr_copy = r2sD_tiled_copy{}.get_slice(tidx);
+        auto pSrD = r2sD_thr_copy.retile_S(rD);
+        auto pDsD = r2sD_thr_copy.partition_D(sD);
+
+        auto gD_epi = zipped_divide(mD, s2gD_tv_tiler{});
+        auto s2gD_thr_copy = s2gD_tiled_copy{}.get_slice(tidx % G2SColPerCTA);
+        
+        // r2s
+        auto pSrD_tmp = make_tensor_like<DType>(pSrD(make_coord(_, _), 0, 0));
         CUTE_UNROLL
-        for (uint32_t i=0; i < size<1>(rD); ++i) {
+        for (uint32_t i=0; i < size<1>(pSrD); ++i) {
             CUTE_UNROLL
-            for (uint32_t j=0; j < size<2>(rD); ++j) {
-                if (skip_helper.rMask_st[i*2]) {
-                    uint32_t d_pack_0 = AccumlatorPack2<DType>{}(rD(make_coord(1, 0), i, j), rD(make_coord(0, 0), i, j));
-                    *reinterpret_cast<uint32_t*>(&mD(skip_helper.rIndex_st[i*2], mD_col_idx + j * MMACol * 8)) = d_pack_0;
-                }
-                if (skip_helper.rMask_st[i*2+1]) {
-                    uint32_t d_pack_1 = AccumlatorPack2<DType>{}(rD(make_coord(1, 1), i, j), rD(make_coord(0, 1), i, j));
-                    *reinterpret_cast<uint32_t*>(&mD(skip_helper.rIndex_st[i*2+1], mD_col_idx + j * MMACol * 8)) = d_pack_1;
-                }
+            for (uint32_t j=0; j < size<2>(pSrD); ++j) {
+                copy(pSrD(make_coord(_, _), i, j), pSrD_tmp);
+                copy(pSrD_tmp, pDsD(make_coord(_, _), i, j));
             }
         }
+        __syncthreads();
+
+        // s2g
+        CUTE_UNROLL
+        for (uint32_t i=0, j=threadIdx.x / G2SColPerCTA; i < G2SIter; ++i, j+=G2SRowPerCTA) {
+            if (skip_helper.rMask[i]) {
+                auto gDtD = gD_epi(make_coord(_, _), make_coord(skip_helper.rIndex_ld[i], bidy));
+                auto pSrD_s2g = s2gD_thr_copy.partition_S(sD);
+                auto pDgD = s2gD_thr_copy.partition_D(gDtD);
+                copy(s2gD_tiled_copy{}, pSrD_s2g(make_coord(_, _), j, _), pDgD(make_coord(_, _), 0, _));
+                // if (tidx == 0 && (bidx + bidy + bidz == 0) && i == 0) {
+                //     cute::print(pSrD_s2g); cute::print("\n");
+                //     cute::print(gDtD); cute::print("\n");
+                //     cute::print(pSrD_s2g(make_coord(_, _), j, _)); cute::print("\n");
+                //     cute::print(pDgD(make_coord(_, _), _, _)); cute::print("\n");
+                // }
+
+            }
+        }
+
+
+        // if (tidx == 0 && (bidx + bidy + bidz == 0)) {
+        //     cute::print(pSrD); cute::print("\n");
+        //     cute::print(pDsD); cute::print("\n");
+        // }
     }
-    else {
-        // atomic add for split-k
+
+
+    // direct copy s2g
+    // if constexpr (SplitK == 1) {
+    //     // retile rD to warp scatter layout, then write back based on half2, etc.
+    //     ElementWiseActivation<decltype(rD), kAct>{}(rD);
+    //     uint32_t mD_col_idx = base_off_n + (warp_id % MMACol) * 8 + (lane_id % 4) * 2;
+    //     CUTE_UNROLL
+    //     for (uint32_t i=0; i < size<1>(rD); ++i) {
+    //         CUTE_UNROLL
+    //         for (uint32_t j=0; j < size<2>(rD); ++j) {
+    //             if (skip_helper.rMask_st[i*2]) {
+    //                 uint32_t d_pack_0 = AccumlatorPack2<DType>{}(rD(make_coord(1, 0), i, j), rD(make_coord(0, 0), i, j));
+    //                 *reinterpret_cast<uint32_t*>(&mD(skip_helper.rIndex_st[i*2], mD_col_idx + j * MMACol * 8)) = d_pack_0;
+    //             }
+    //             if (skip_helper.rMask_st[i*2+1]) {
+    //                 uint32_t d_pack_1 = AccumlatorPack2<DType>{}(rD(make_coord(1, 1), i, j), rD(make_coord(0, 1), i, j));
+    //                 *reinterpret_cast<uint32_t*>(&mD(skip_helper.rIndex_st[i*2+1], mD_col_idx + j * MMACol * 8)) = d_pack_1;
+    //             }
+    //         }
+    //     }
+    // }
+    // else {
+    //     // atomic add for split-k
         
-    }
+    // }
 
     
     // if (tidx == 0 && (bidx + bidy + bidz == 0)) {
@@ -796,7 +885,7 @@ struct GatherScatterGEMMKernel {
         };
 
         // host-side static tiling
-        using warp_layout_traits = WarpLayoutTraits<kBM, kBK, 4, sizeof(DType)>;
+        using warp_layout_traits = WarpLayoutTraits<kBM, kBN, kBK, 4, sizeof(DType)>;
         using mma_traits = MmaTraits<kBM, kBN, kBK, kPipeline, warp_layout_traits, DType>;
         constexpr auto kernel = gather_scatter_gemm_kernel<
             kBM, kBN, kBK, 4, kPipeline, kSplitK, kN, kK, kNG, kNGIter,

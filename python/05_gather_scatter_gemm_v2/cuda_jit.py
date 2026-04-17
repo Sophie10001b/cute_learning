@@ -171,7 +171,7 @@ def ref_program(
 
 
 if __name__ == "__main__":
-    device = 'cuda:0'
+    device = 'cuda:1'
     dtype = torch.float16
 
     M = 4096
@@ -179,8 +179,8 @@ if __name__ == "__main__":
     K = 4096
     NG = 32
 
-    A = torch.rand((1, M, K), dtype=dtype, device=device) * 0.01
-    B = torch.rand((N, K), dtype=dtype, device=device) * 0.01
+    A = torch.rand((1, M, K), dtype=dtype, device=device)
+    B = torch.rand((N, K), dtype=dtype, device=device)
     Mask = torch.rand((1, M, NG), device=device) > 0.5
     D = torch.zeros((M, N), dtype=dtype, device=device)
 
