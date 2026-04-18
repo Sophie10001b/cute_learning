@@ -534,18 +534,15 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
 
     Tensor sA = make_tensor(
         make_smem_ptr(smem_ab.A.begin()),
-        make_shape(Int<BM>{}, Int<BK>{}, Int<Pipeline>{}),
-        make_stride(Int<BK>{}, _1{}, Int<BK * BM>{})
+        sALayout{}
     );
     Tensor sB = make_tensor(
         make_smem_ptr(smem_ab.B.begin()),
-        make_shape(Int<BN>{}, Int<BK>{}, Int<Pipeline>{}),
-        make_stride(Int<BK>{}, _1{}, Int<BK * BN>{})
+        sBLayout{}
     );
     Tensor sD = make_tensor(
         make_smem_ptr(smem_d.D.begin()),
-        make_shape(Int<BM>{}, Int<BN>{}),
-        make_stride(Int<BN>{}, _1{})
+        sDLayout{}
     );
 
     //
@@ -761,51 +758,7 @@ __global__ void gather_scatter_gemm_kernel(const __grid_constant__ GEMMParams pa
 
             }
         }
-
-
-        // if (tidx == 0 && (bidx + bidy + bidz == 0)) {
-        //     cute::print(pSrD); cute::print("\n");
-        //     cute::print(pDsD); cute::print("\n");
-        // }
     }
-
-
-    // direct copy s2g
-    // if constexpr (SplitK == 1) {
-    //     // retile rD to warp scatter layout, then write back based on half2, etc.
-    //     ElementWiseActivation<decltype(rD), kAct>{}(rD);
-    //     uint32_t mD_col_idx = base_off_n + (warp_id % MMACol) * 8 + (lane_id % 4) * 2;
-    //     CUTE_UNROLL
-    //     for (uint32_t i=0; i < size<1>(rD); ++i) {
-    //         CUTE_UNROLL
-    //         for (uint32_t j=0; j < size<2>(rD); ++j) {
-    //             if (skip_helper.rMask_st[i*2]) {
-    //                 uint32_t d_pack_0 = AccumlatorPack2<DType>{}(rD(make_coord(1, 0), i, j), rD(make_coord(0, 0), i, j));
-    //                 *reinterpret_cast<uint32_t*>(&mD(skip_helper.rIndex_st[i*2], mD_col_idx + j * MMACol * 8)) = d_pack_0;
-    //             }
-    //             if (skip_helper.rMask_st[i*2+1]) {
-    //                 uint32_t d_pack_1 = AccumlatorPack2<DType>{}(rD(make_coord(1, 1), i, j), rD(make_coord(0, 1), i, j));
-    //                 *reinterpret_cast<uint32_t*>(&mD(skip_helper.rIndex_st[i*2+1], mD_col_idx + j * MMACol * 8)) = d_pack_1;
-    //             }
-    //         }
-    //     }
-    // }
-    // else {
-    //     // atomic add for split-k
-        
-    // }
-
-    
-    // if (tidx == 0 && (bidx + bidy + bidz == 0)) {
-    //     // cute::print(pSrA); cute::print("\n");
-    //     // cute::print(pDrA); cute::print("\n");
-    //     // cute::print(pSrB); cute::print("\n");
-    //     // cute::print(pDrB); cute::print("\n");
-    //     // cute::print(rA); cute::print("\n");
-    //     // cute::print(rB); cute::print("\n");
-    //     cute::print(rD); cute::print("\n");
-    // }
-
 }
 
 template <
