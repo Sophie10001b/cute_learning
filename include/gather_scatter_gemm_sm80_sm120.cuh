@@ -182,7 +182,7 @@ struct MmaTraits {
     using s2rB_atom = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, DType>;
     using mma_atom = cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>;
 
-    static constexpr uint32_t s2g_copy_width = (BN / G2SColPerCTA) * sizeof(DType);
+    static constexpr uint32_t s2g_copy_width = cute::min((BN / G2SColPerCTA) * sizeof(DType), 16);
 
     using s2g_copy_type = typename CopyWidthToType<s2g_copy_width>::type;
     using r2sD_atom = cute::Copy_Atom<cute::UniversalCopy<uint32_t>, DType>;

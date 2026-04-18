@@ -177,30 +177,37 @@ if __name__ == "__main__":
     M = 4095
     N = 4096
     K = 2048
-    G = 32
+    G = 128
 
     import random
-    for _ in range(3):
+    for _ in range(5):
         sparsity = random.uniform(0.0, 0.9)
+        # sparsity = 0.5
         # M = random.randint(1024, 4096)
         # N = random.choice([4096, 5120])
         # K = random.choice([1024, 4096, 5120, 14336])
-        M = 4096
-        N = 5120
-        K = 5120
+        M = 8192
+        N = 8192
+        K = 8192
 
         A = torch.randn((1, M, K), dtype=dtype, device=device)
         B = torch.randn((N, K), dtype=dtype, device=device)
         Mask = torch.rand((1, M, N // G), device=device) >= sparsity
-        D = torch.zeros((M, N), dtype=dtype, device=device)
+        # D = torch.zeros((M, N), dtype=dtype, device=device)
 
+        # D_cute = gather_scatter_gemm_cute(
+        #     deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5
+        # )
+        # D_ref = ref_program(
+        #     deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5
+        # )
         D_cute = gather_scatter_gemm_cute(
-            deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5
+            A, B, Mask, None, activation='identity', estimate_sparsity=0.5
         )
         D_ref = ref_program(
-            deepcopy(A), deepcopy(B), deepcopy(Mask), deepcopy(D), activation='identity', estimate_sparsity=0.5
+            A, B, Mask=Mask, D=None, activation='identity', estimate_sparsity=0.5
         )
-
+        
         diff = (D_cute - D_ref).abs()
         max_diff = diff.max()
         mean_diff = diff.mean()

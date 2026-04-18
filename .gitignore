@@ -11,3 +11,4 @@ profile_result
 build
 profiler_logs
 .cache
+/ncu_reports
